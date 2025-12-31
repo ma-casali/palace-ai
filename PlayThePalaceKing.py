@@ -31,7 +31,7 @@ def play_against_kings(king_path):
     # map ranks to human readable
     rank_names = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"]
 
-    print("Game Start! You are Player 1.")
+    print("Game Start! You are Player 0.")
 
     with torch.inference_mode():
         while not done:
@@ -41,16 +41,31 @@ def play_against_kings(king_path):
 
             if current_player_idx == 0: # user turn
                 print("\n" + "="*30)
-                print(f"TOP CARD: {rank_names[env.discard_pile.cards[-1]] if env.discard_pile.cards else 'Empty Discard Pile'}")
-                print(f"YOUR HAND: {[f'{rank_names[i]} (x{int(env.hands[0][i])})' for i in range(13) if env.hands[0][i] > 0]}")
+                print(f"TOP CARD: {rank_names[env.discard_pile.cards[-1]]+' with '+str(len(env.discard_pile.cards))+' cards in discard pile' if env.discard_pile.cards else 'Empty Discard Pile'}\n")
+                print(f"Your Hand: {[f'{rank_names[i]} (x{int(env.hands[0][i])})' for i in range(13) if env.hands[0][i] > 0]}")
                 print(f"Your Face-Up Pile: {[f'{rank_names[i]} (x{int(env.face_up_piles[0][i])})' for i in range(13) if env.face_up_piles[0][i] > 0]}")
-                print(f"Opponent 1's Face-Up Piles: {[f'{rank_names[i]} (x{int(env.face_up_piles[1][i])})' for i in range(13) if env.face_up_piles[1][i] > 0]}")
-                print(f"Opponent 2's Face-Up Piles: {[f'{rank_names[i]} (x{int(env.face_up_piles[2][i])})' for i in range(13) if env.face_up_piles[2][i] > 0]}")
+                print(f"Your Face-Down Pile: {'x '*sum(env.face_down_piles[0]) if any(env.face_down_piles[0][i] > 0 for i in range(13)) else ''}\n")
+                
+                print(f"Opponent 1 has: {int(sum(env.hands[1]))} card(s) in hand.")
+                print(f"Opponent 1's Face-Up Cards: {[f'{rank_names[i]} (x{int(env.face_up_piles[1][i])})' for i in range(13) if env.face_up_piles[1][i] > 0]}")
+                print(f"Opponent 1's Face-Down Cards: {'x '*sum(env.face_down_piles[1]) if any(env.face_down_piles[1][i] > 0 for i in range(13)) else ''}\n")
+                
+                print(f"Opponent 2 has: {int(sum(env.hands[2]))} card(s) in hand.")
+                print(f"Opponent 2's Face-Up Cards: {[f'{rank_names[i]} (x{int(env.face_up_piles[2][i])})' for i in range(13) if env.face_up_piles[2][i] > 0]}")
+                print(f"Opponent 2's Face-Down Cards: {'x '*sum(env.face_down_piles[2]) if any(env.face_down_piles[2][i] > 0 for i in range(13)) else ''}\n")
 
-                mask = get_valid_mask(env.hands[0], env.discard_pile, env.face_up_piles[0], env.face_down_piles[0])
+                mask = get_valid_mask(env.hands[current_player_idx],
+                                        env.discard_pile,
+                                        env.face_up_piles[current_player_idx],
+                                        env.face_down_piles[current_player_idx])
+                input_vec = torch.tensor(create_input_vector(action_history, env.hands[current_player_idx], mask), dtype=torch.float32)
+                mask_vec = torch.tensor(mask.flatten(), dtype=torch.bool)
+
+                probs = king_model(input_vec, mask_vec)
+                suggested_idx = torch.argmax(probs).item()
                 valid_indices = np.where(mask)[0]
 
-                print("\nValid Actions:")
+                print(f"\nValid Actions: AI suggests action [{suggested_idx}]")
                 for idx in valid_indices:
                     if idx == 78:
                         print(f"[{idx}] - Pick up the deck")
@@ -58,7 +73,10 @@ def play_against_kings(king_path):
                         cat = idx // 13
                         rank = idx % 13
                         move_type = ["Hand", "Hand x 2", "Hand x 3", "Hand x 4", "Face-Up", "Face-Down"][cat]
-                        print(f"[{idx}] - Play from {move_type} {rank_names[rank]}")
+                        if cat <= 4:
+                            print(f"[{idx}] - Play from {move_type} {rank_names[rank]}")
+                        else:
+                            print(f"[{idx}] - Play from {move_type} (unknown card)")
 
                 choice = -1
                 while choice not in valid_indices:

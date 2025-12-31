@@ -1,0 +1,6 @@
+ipython==8.18.1
+matplotlib==3.9.4
+pip-chill==1.0.3
+pyqt6==6.10.1
+torch==2.8.0
+tqdm==4.67.1

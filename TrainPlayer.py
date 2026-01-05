@@ -138,17 +138,17 @@ def finish_batch_update(players, optimizers, log_probs, entropies, rewards, ent_
 # endregion
 
 environment = PalaceEnv(num_players=3) # default 2 players
-plotter = LivePlot()
+# plotter = LivePlot()
 all_returns = []
 all_entropies = []
 
 num_generations = 100
-batch_size = 16
+batch_size = 32
 num_episodes = batch_size * 10
 learning_rate = 1e-3
 max_turns = 1000
-initial_entropy_coef = 0.01
-final_entropy_coef = 0.001
+initial_entropy_coef = 0.05
+final_entropy_coef = 0.005
 ent_decay = 0.95
 current_ent_coef = initial_entropy_coef
 total_loss = np.zeros(environment.num_players)
@@ -285,7 +285,7 @@ for generation in range(num_generations):
 
     # average values for plotting
     avg_gen_reward = np.array(total_gen_reward / (num_episodes))
-    plotter.update(generation, avg_gen_reward, total_loss)
+    # plotter.update(generation, avg_gen_reward, total_loss)
 
     # region Player Evaluation
     print("Evaluating players against current best...")

@@ -1,6 +1,7 @@
 import numpy as np
 from CardGame import get_valid_mask, PalaceEnv, PalacePlayer
 import torch
+from colorama import Fore, Style, init
 
 def create_input_vector(last_actions, current_hand, valid_mask):
     last_actions_flat = np.array(last_actions).flatten()  # Shape: (39,)
@@ -23,6 +24,7 @@ def play_against_kings(king_path):
     players = [None, king_model, king_model]
     action_history = [np.zeros(13) for _ in range(3)]
     env.reset(players)
+    print(env.hands)
 
     players_out = [] # track players who have finished their game
     done = False
@@ -40,7 +42,7 @@ def play_against_kings(king_path):
                 continue
 
             if current_player_idx == 0: # user turn
-                print("\n" + "="*30)
+                print(f"{Fore.BLACK}\n" + "="*30)
                 print(f"TOP CARD: {rank_names[env.discard_pile.cards[-1]]+' with '+str(len(env.discard_pile.cards))+' cards in discard pile' if env.discard_pile.cards else 'Empty Discard Pile'}\n")
                 print(f"Your Hand: {[f'{rank_names[i]} (x{int(env.hands[0][i])})' for i in range(13) if env.hands[0][i] > 0]}")
                 print(f"Your Face-Up Pile: {[f'{rank_names[i]} (x{int(env.face_up_piles[0][i])})' for i in range(13) if env.face_up_piles[0][i] > 0]}")
@@ -99,12 +101,18 @@ def play_against_kings(king_path):
                 action_idx = torch.argmax(probs).item()
 
                 if action_idx == 78:
-                    print(f"\nOpponent {current_player_idx} picks up the deck.")
+                    if current_player_idx == 1:
+                        print(f"{Fore.RED}\nOpponent {current_player_idx} picks up the deck.")
+                    else: 
+                        print(f"{Fore.BLUE}\nOpponent {current_player_idx} picks up the deck.")
                 else:
                     cat = action_idx // 13
                     rank = action_idx % 13
                     move_type = ["Hand", "Hand x 2", "Hand x 3", "Hand x 4", "Face-Up", "Face-Down"][cat]
-                    print(f"\nOpponent {current_player_idx} plays from {move_type} {rank_names[rank]}")
+                    if current_player_idx == 1:
+                        print(f"{Fore.RED}\nOpponent {current_player_idx} plays from {move_type} {rank_names[rank]}")
+                    else:
+                        print(f"{Fore.BLUE}\nOpponent {current_player_idx} plays from {move_type} {rank_names[rank]}")
 
             # Execute step
             done, action_history, current_player_idx, players_out, _ = env.step(action_idx, action_history, current_player_idx, players_out)

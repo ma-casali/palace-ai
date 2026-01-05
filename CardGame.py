@@ -13,27 +13,25 @@ def shuffle_deck():
 def get_valid_mask(hand, discard_pile, face_up_pile, face_down_pile):
     mask = np.zeros((6, 13), dtype=bool)
     
-    # 1. POSSESSION CHECK (Only mask True if the player OWNS the card)
+    # Check for possession
     for rank in range(13):
-        # Hand play (1-4 cards)
-        for num_cards in range(1, 5):
-            if hand[rank] >= num_cards:
-                mask[num_cards - 1, rank] = True
-
-        # Face-up play (Only if hand is empty)
-        if np.sum(hand) == 0 and face_up_pile[rank] > 0:
-            mask[4, rank] = True
-
         # Face-down play (Only if hand and face-up are empty)
-        if np.sum(hand) == 0 and np.sum(face_up_pile) == 0 and face_down_pile[rank] > 0:
+        if np.sum(hand) == 0 and np.sum(face_up_pile) == 0 and np.sum(face_down_pile) > 0:
             mask[5, rank] = True
+        # Face-up play (Only if hand is empty)
+        elif np.sum(hand) == 0 and face_up_pile[rank] > 0:
+            mask[4, rank] = True
+        # Hand play (1-4 cards)
+        else:
+            for num_cards in range(1, 5):
+                if hand[rank] >= num_cards:
+                    mask[num_cards - 1, rank] = True
 
     mask_pickup = len(discard_pile.cards) > 0
 
-    # 2. DISCARD PILE RESTRICTIONS
+    # Restrictions from discard pile
     if mask_pickup:
         top_card = discard_pile.cards[-1]
-
         # check for three first
         if top_card == 1:
             for rank in range(13):
@@ -139,7 +137,11 @@ class PalaceEnv:
         elif action_category == 4: # From Face-Up
             card_rank = action_idx % 13
             self.face_up_piles[current_player_idx][card_rank] -= 1
-            self.discard_pile.add(card_rank)
+
+            if card_rank == 8: # 10 card
+                self.discard_pile.cards = []
+            else:
+                self.discard_pile.add(card_rank)
             
             step_reward += 5.0
 
@@ -167,7 +169,9 @@ class PalaceEnv:
                         is_fail = True
                 
                 if is_fail: # blind pick failed
-                    self.discard_pile.add(chosen_rank)
+                    # add card to hand
+                    self.hands[current_player_idx][card_rank] += 1
+                    # pick up the discard pile
                     picked_cards = list(self.discard_pile.cards)
                     for card in picked_cards:
                         self.hands[current_player_idx][card] += 1
@@ -186,8 +190,9 @@ class PalaceEnv:
             picked_cards = list(self.discard_pile.cards) # Copy the list
             
             # Special logic for the '3' card (Rank 1)
-            if len(picked_cards) > 0 and picked_cards[-1] == 1:
-                picked_cards.pop()
+            while len(picked_cards) > 0 and picked_cards[-1] == 1:
+                if len(picked_cards) > 0:
+                    picked_cards.pop()
 
             for card in picked_cards:
                 self.hands[current_player_idx][card] += 1
@@ -239,9 +244,7 @@ class PalaceEnv:
 
         # 5. TURN ROTATION
         if card_rank is not None:
-            if card_rank == 1: # Play again (or skip) logic
-                current_player_idx = (current_player_idx + 2) % self.num_players
-            elif card_rank == 8: # 10 goes again
+            if card_rank == 8: # 10 goes again
                 pass 
             else:
                 current_player_idx = (current_player_idx + 1) % self.num_players

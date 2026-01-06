@@ -5,13 +5,17 @@ import tqdm
 import copy
 import matplotlib.pyplot as plt
 
-from CardGame import shuffle_deck, get_valid_mask, DrawPile, DiscardPile, PalaceEnv, PalacePlayer
+from CardGame import shuffle_deck, get_valid_mask, DrawPile, DiscardPile, PalaceEnv
+from PalacePlayer import PalacePlayer
 
 # inputs: 
-# - last 3 actions to discard (3 x 13)
-# - current hand (1 x 13)
-# - logit mask of valid actions (6 x 13) + 1 this must match output!
-# --> Flattened (batch_size x 131)
+# Sequence (N x 13):
+# - action history (N x 13)
+
+# Static (27 * (1 + M) + 1 = 82 for 3 players):
+# - current hand (1 x 13), current face-up (1 x 13), length face-down (1)
+# - other player's hand (M x 13), other player's face-up (M x 13), length other face-down (M)
+# - draw pile length (1)
 
 # outputs:
 # - softmax action probabilities (6 x 13) + 1
@@ -83,56 +87,86 @@ def cards_left(env, player_idx):
     face_down_count = np.sum(env.face_down_piles[player_idx])
     return int(hand_count + face_up_count + face_down_count)
 
-def create_input_vector(last_actions, current_hand, valid_mask):
-    last_actions_flat = np.array(last_actions).flatten()  # Shape: (39,)
-    current_hand_flat = np.array(current_hand).flatten()  # Shape: (13,)
-    valid_mask_flat = np.array(valid_mask).flatten()      # Shape: (79,)
+def update_action_history(action_history, new_action, N = 13):
+    # action_history shape: (1, N, 79)
+    # new_action: int (0-78)
 
-    input_vector = np.concatenate([last_actions_flat, current_hand_flat, valid_mask_flat])
-    return input_vector  # Shape: (131,)
+    # create one-hot encoding for new action
+    new_action_one_hot = torch.zeros((1, 1, 79)).to(device)
+    if new_action != 1: 
+        new_action_one_hot[0, 0, new_action] = 1.0
 
-def finish_batch_update(players, optimizers, log_probs, entropies, rewards, ent_coef, king_available=False):
+    # slide the window
+    updated_history = torch.cat((action_history[:, 1:, :], new_action_one_hot), dim=1)
+
+    return updated_history  # shape: (1, N, 79)
+
+def create_static_input_vector(env, current_player_idx):
+    input_vector = torch.zeros((27 * env.num_players + 1,), dtype = torch.float32, device = device)
+
+    input_vector[:13] = env.hands[current_player_idx]
+    input_vector[13:26] = env.face_up_piles[current_player_idx]
+    input_vector[26] = torch.sum(env.face_down_piles[current_player_idx])
+    offset = 27
+    for i in range(env.num_players):
+        if i != current_player_idx:
+            input_vector[offset:offset + 13] = env.hands[i]
+            input_vector[offset + 13:offset + 26] = env.face_up_piles[i]        
+            input_vector[offset + 26] = torch.sum(env.face_down_piles[i])
+            offset += 27
+
+    input_vector[-1] = len(env.draw_pile.deck)
+    return input_vector.unsqueeze(0)  # Shape: (1, 27 * env.num_players + 1)
+
+def finish_batch_update(players, optimizers, b_hist, b_stat, b_mask, b_lp, b_ent, b_rew, ent_coef, king_available=False):
     gamma = 0.98
     start_idx = 1 if king_available else 0
-    player_loss = np.zeros(len(players))
+
+    player_losses = torch.zeros(len(players), device=device)
 
     for i in range(start_idx, len(players)):
-        if not batch_log_probs[i]: 
-            total_loss = 0.0
-            continue
+        if not b_lp[i]: continue
         
-        player_policy_losses = []
-
-        # Iterate through each episode in the batch
-        for episode_lp, episode_e, episode_r in zip(batch_log_probs[i], batch_entropies[i], batch_rewards[i]):
-            # discounted returns
-            returns = []
+        flat_ent = torch.cat([torch.stack(ep) for ep in b_ent[i]]).flatten()
+        player_eps_lp = [torch.stack(ep) for ep in b_lp[i] if len(ep) > 0]
+        if not player_eps_lp: continue
+        flat_lp = torch.cat(player_eps_lp).flatten()
+        
+        # 2. Gather returns for THIS player
+        flat_returns = []
+        for ep_lp, ep_rew in zip(b_lp[i], b_rew[i]):
+            # CRITICAL CHECK: Does the number of rewards match the number of actions?
+            if len(ep_lp) != len(ep_rew):
+                # If rewards are longer (e.g. terminal reward), trim or merge them
+                # This ensures ep_rew matches ep_lp 1:1
+                ep_rew = ep_rew[:len(ep_lp)] 
+                
             G = 0
-            for r in reversed(episode_r):
-                G = r + gamma * G
-                returns.insert(0, G)
-            
-            returns = torch.tensor(returns, dtype = torch.float32).to(device)
+            returns = torch.zeros(len(ep_rew), device=device)
+            for t in reversed(range(len(ep_rew))):
+                G = ep_rew[t] + gamma * G
+                returns[t] = G
+            flat_returns.append(returns)
+        
+        returns_tensor = torch.cat(flat_returns)
 
-            # standardize returns
-            if returns.numel() > 1:
-                returns = (returns - returns.mean()) / (returns.std() + 1e-9)
-            
-            # calculate loss for each move
-            for log_p, ent, G_t in zip(episode_lp, episode_e, returns):
-                loss = -log_p * G_t - ent_coef * ent
-                player_policy_losses.append(loss)
+        # 3. Final Check before multiplication
+        if flat_lp.shape[0] != returns_tensor.shape[0]:
+            raise RuntimeError(f"Player {i} mismatch: {flat_lp.shape[0]} actions vs {returns_tensor.shape[0]} rewards")
 
-        if player_policy_losses:
-            optimizer = optimizers[i]
-            optimizer.zero_grad()
-            total_loss = torch.stack(player_policy_losses).mean() # mean loss over batch
-            player_loss[i] = total_loss.detach().cpu().item()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(players[i].parameters(), 1.0) # prevent exploding gradients
-            optimizer.step()
+        loss = -(flat_lp * returns_tensor).mean() - ent_coef * flat_ent.mean()
+
+        optimizer = optimizers[i]
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(players[i].parameters(), 1.0)
+        optimizer.step()
+        b_lp[i].clear()
+        b_ent[i].clear()
+
+        player_losses[i] = loss.detach() # Stay on device
     
-    return player_loss
+    return player_losses # Return the device tensor
     
 
 # endregion
@@ -143,7 +177,7 @@ all_returns = []
 all_entropies = []
 
 num_generations = 100
-batch_size = 32
+batch_size = 8
 num_episodes = batch_size * 10
 learning_rate = 1e-3
 max_turns = 1000
@@ -153,6 +187,7 @@ ent_decay = 0.95
 current_ent_coef = initial_entropy_coef
 total_loss = np.zeros(environment.num_players)
 last_king_loss = 0.0
+N = 12 # number of actions to track in history
 
 players = [PalacePlayer().to(device) for _ in range(environment.num_players)]
 optimizers = [torch.optim.Adam(player.parameters(), lr=learning_rate) for player in players]
@@ -173,6 +208,10 @@ for generation in range(num_generations):
     total_gen_reward = np.zeros(environment.num_players)
 
     # batch buffers
+    batch_histories = [[] for _ in range(environment.num_players)]
+    batch_states = [[] for _ in range(environment.num_players)]
+    batch_masks = [[] for _ in range(environment.num_players)]
+
     batch_log_probs = [[] for _ in range(environment.num_players)]
     batch_entropies = [[] for _ in range(environment.num_players)]
     batch_rewards = [[] for _ in range(environment.num_players)]
@@ -182,11 +221,16 @@ for generation in range(num_generations):
     for _ in pbar_episode:
         environment.reset(players)
 
+        # per-episode buffers
+        episode_histories = [[] for _ in range(environment.num_players)]
+        episode_states = [[] for _ in range(environment.num_players)]
+        episode_masks = [[] for _ in range(environment.num_players)]
+
         episode_log_probs = [[] for _ in range(environment.num_players)]
         episode_entropies = [[] for _ in range(environment.num_players)]
         episode_rewards = [[] for _ in range(environment.num_players)]
 
-        action_history = [np.zeros(13) for _ in range(3)]
+        action_history = -1*torch.ones((1, N, 79), dtype = torch.float32).to(device)  # Initialize with -1 (no action)
         players_out = [] # track players who have finished their game
         done = False
         turn_count = 0
@@ -194,6 +238,7 @@ for generation in range(num_generations):
 
         while not done and turn_count < max_turns:
             if current_player_idx not in players_out:
+
                 # make action decision
                 mask = get_valid_mask(
                     environment.hands[current_player_idx],
@@ -201,8 +246,9 @@ for generation in range(num_generations):
                     environment.face_up_piles[current_player_idx],
                     environment.face_down_piles[current_player_idx]
                 )
-                input_vec = torch.tensor(create_input_vector(action_history, environment.hands[current_player_idx], mask), dtype = torch.float32).to(device)
-                mask_vec = torch.tensor(mask.flatten(), dtype = torch.bool).to(device)
+                state_input = create_static_input_vector(environment, current_player_idx)
+                sequence_input = action_history.detach()
+                mask_vec = mask.flatten()
 
                 # determine if this is the king player (static player)
                 is_static = (current_player_idx == 0 and best_player_weights is not None)
@@ -211,21 +257,27 @@ for generation in range(num_generations):
                 context = torch.no_grad() if is_static else torch.enable_grad()
 
                 with context:
-                    probs = environment.players[current_player_idx](input_vec, mask_vec)
+                    probs = environment.players[current_player_idx](sequence_input, state_input, mask_vec)
                     m = torch.distributions.Categorical(probs)
                     action_idx = m.sample()
 
-                # record the move (only for learning players)
-                if not is_static:
-                    episode_log_probs[current_player_idx].append(m.log_prob(action_idx))
-                    episode_entropies[current_player_idx].append(m.entropy())
+                # update action history
+                action_history = update_action_history(action_history, action_idx, N = N)
 
                 # record the reward received for that move
                 prev_player = current_player_idx
-                done, action_history, current_player_idx, players_out, s_reward = environment.step(action_idx.cpu().item(), action_history, current_player_idx, players_out)
+                done, current_player_idx, players_out, s_reward = environment.step(action_idx.cpu(), current_player_idx, players_out)
 
-                # record rewards for all players (helpful for loser penalty)
-                episode_rewards[prev_player].append(s_reward)
+                player_was_static = (prev_player == 0 and best_player_weights is not None)
+                if not player_was_static:
+                    # store log prob and entropy
+                    episode_log_probs[prev_player].append(m.log_prob(action_idx))
+                    episode_entropies[prev_player].append(m.entropy())
+                    episode_rewards[prev_player].append(s_reward)
+                    # store inputs for this turn
+                    episode_histories[prev_player].append(sequence_input.squeeze(0).detach())
+                    episode_states[prev_player].append(state_input.squeeze(0).detach())
+                    episode_masks[prev_player].append(mask_vec.detach())
 
             turn_count += 1
 
@@ -248,7 +300,13 @@ for generation in range(num_generations):
                     episode_rewards[i][-1] -= 10.0
 
         # Add this episode's data to the batch buffers
+        assert len(episode_rewards[i]) ==  len(episode_log_probs[i]), \
+            f"Mismatch! Player {i} has {len(episode_rewards[i])} rewards for {len(episode_log_probs[i])} actions."
         for i in range(environment.num_players):
+            batch_histories[i].append(episode_histories[i])
+            batch_states[i].append(episode_states[i])
+            batch_masks[i].append(episode_masks[i])
+
             batch_log_probs[i].append(episode_log_probs[i])
             batch_entropies[i].append(episode_entropies[i])
             batch_rewards[i].append(episode_rewards[i])
@@ -257,25 +315,34 @@ for generation in range(num_generations):
 
         # BATCH UPDATE
         if episodes_in_batch >= batch_size:
-            assert len(episode_rewards[i]) ==  len(episode_log_probs[i]), \
-                f"Mismatch! Player {i} has {len(episode_rewards[i])} rewards for {len(episode_log_probs[i])} actions."
+            
             # Update the players using the accumulated batch data
-            # move batch data to device
-            batch_log_probs = [[ [lp.to(device) for lp in ep] for ep in player_eps] for player_eps in batch_log_probs]
-            batch_entropies = [[ [e.to(device) for e in ep] for ep in player_eps] for player_eps in batch_entropies]
-            total_loss = finish_batch_update(players, optimizers, batch_log_probs, batch_entropies, batch_rewards, ent_coef=current_ent_coef, king_available=(best_player_weights is not None))
+            total_loss = finish_batch_update(
+                players,
+                optimizers, 
+                batch_histories, 
+                batch_states, 
+                batch_masks, 
+                batch_log_probs, 
+                batch_entropies, 
+                batch_rewards, 
+                ent_coef=current_ent_coef, 
+                king_available=(best_player_weights is not None)
+            )            
             total_loss[0] = last_king_loss  # retain king loss for logging
 
             #decay entropy coefficient
             current_ent_coef = max(final_entropy_coef, current_ent_coef * ent_decay)
 
-            # Reset buffers
+            # reset batch buffers
+            batch_histories = [[] for _ in range(environment.num_players)]
+            batch_states = [[] for _ in range(environment.num_players)]
+            batch_masks = [[] for _ in range(environment.num_players)]
+
             batch_log_probs = [[] for _ in range(environment.num_players)]
             batch_entropies = [[] for _ in range(environment.num_players)]
             batch_rewards = [[] for _ in range(environment.num_players)]
             episodes_in_batch = 0
-
-        pbar_episode.set_postfix({"Batch: ": f"{episodes_in_batch}/{batch_size}", "Loss": total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss})
 
         for i in range(environment.num_players):
             if episode_rewards[i]:
@@ -288,15 +355,23 @@ for generation in range(num_generations):
     # plotter.update(generation, avg_gen_reward, total_loss)
 
     # region Player Evaluation
-    print("Evaluating players against current best...")
+    print(f"Evaluating generation {generation} players against current best...")
     loss_history = [0 for _ in range(len(players))]
     games_played = 0
     num_games = 20 * environment.num_players  
     max_turns = 1000
-    with torch.inference_mode():
-        while games_played < num_games:
-            environment.reset(players)
+    N = 12 # Sequence length
 
+    # Ensure all players are in eval mode
+    for p in players:
+        p.eval()
+
+    with torch.inference_mode():
+        while sum(loss_history) < num_games:
+            environment.reset(players)
+            
+            # Initialize evaluation action history (Batch, Seq, Dim)
+            action_history = torch.zeros((1, N, 79), device=device)
             players_out = []
             done = False
             turn_count = 0 
@@ -304,37 +379,51 @@ for generation in range(num_generations):
 
             while not done and turn_count < max_turns:
                 if current_player_idx not in players_out:
-
-                    # make action decision
+                    # 1. Generate Inputs
                     mask = get_valid_mask(
                         environment.hands[current_player_idx],
                         environment.discard_pile,
                         environment.face_up_piles[current_player_idx],
                         environment.face_down_piles[current_player_idx]
                     )
-                    input_vec = torch.tensor(create_input_vector(action_history, environment.hands[current_player_idx], mask), dtype = torch.float32)
-                    mask_vec = torch.tensor(mask.flatten(), dtype = torch.bool)
-
-                    probs = environment.players[current_player_idx](input_vec, mask_vec)
+                    
+                    # Prepare Static Vector (1, 82)
+                    state_input = create_static_input_vector(environment, current_player_idx)
+                    # Use current history (1, 12, 79)
+                    sequence_input = action_history 
+                    
+                    # 2. Get Model Prediction
+                    # Model now expects (history, static, mask)
+                    probs = players[current_player_idx](sequence_input, state_input, mask)
                     action_idx = torch.argmax(probs).item()
 
-                    # record the move
+                    # 3. Environment Step
+                    # environment.step returns updated state and info
                     prev_player = current_player_idx
-                    done, action_history, current_player_idx, players_out, s_reward = environment.step(action_idx, action_history, current_player_idx, players_out)
+                    done, current_player_idx, players_out, _ = environment.step(
+                        action_idx, current_player_idx, players_out
+                    )
+
+                    # 4. Update History with the action taken
+                    # Shift history and add the new action as a one-hot vector
+                    new_action_oh = torch.zeros((1, 1, 79), device=device)
+                    new_action_oh[0, 0, action_idx] = 1.0
+                    action_history = torch.cat((action_history[:, 1:, :], new_action_oh), dim=1)
+
+                else:
+                    # If current player is out, rotate to next
+                    current_player_idx = (current_player_idx + 1) % environment.num_players
 
                 turn_count += 1
 
+            # Determine "Loser" for this evaluation game
             if done:
-                # Normal completion
                 all_indices = set(range(environment.num_players))
                 loser_idx = list(all_indices - set(players_out))[0]
                 loss_history[loser_idx] += 1
             else:
-                # Max turns reached, determine winner by least cards
-                cards_counts = [cards_left(environment, idx) for idx in range(environment.num_players)]
-                loss_history[np.argmax(cards_counts)] += 1
-                
-            games_played += 1
+                # Stalemate: All players lose equally
+                loss_history = [loss + 1 for loss in loss_history]  
 
     # if the king player lost only their equal share of games they stay
     if loss_history[0] <= 20: # king player won at least 20 games

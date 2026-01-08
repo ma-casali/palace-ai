@@ -31,68 +31,78 @@ print(f"Using device: {device}")
 # region Classes
 class LivePlot:
     def __init__(self):
-        self.generation_history = None
-        self.reward_history = None
-        self.lr_history = None
-        self.total_loss_history = None
-        self.entropy_history = None
-        self.stalemate_history = None
-        self.smoothed_reward = []
-        self.smoothed_loss = []
-
-        self.fig, self.ax = plt.subplots(3, 1, figsize=(15, 10))
+        # Initialize as empty lists for easier appending, convert to arrays for plotting
+        self.generation_history = []
+        self.reward_history = []
+        self.lr_history = []
+        self.total_loss_history = []
+        self.entropy_history = []
+        self.stalemate_history = []
+        self.smooth_win = 25
+        
+        # We'll calculate smoothed values on the fly to avoid list/array mismatches
+        self.fig, self.ax = plt.subplots(3, 1, figsize=(10, 6))
+        plt.ion() # Turn on interactive mode
 
     def update(self, generation, reward, total_loss, lr, entropy, stalemate_rate):
-        if self.generation_history is None:
-            self.generation_history = np.array(generation)
-            self.reward_history = np.array([reward])
-            self.total_loss_history = np.array([total_loss])
-            self.lr_history = np.array([lr])
-            self.entropy_history = np.array([entropy])
-            self.stalemate_history = np.array([stalemate_rate])
+        # Append new data to lists
+        self.generation_history.append(generation)
+        self.reward_history.append(reward)  # Assuming reward is a list/tensor of 3 players
+        self.total_loss_history.append(total_loss)
+        self.lr_history.append(lr)
+        self.entropy_history.append(entropy)
+        self.stalemate_history.append(stalemate_rate)
+
+        # Convert to numpy arrays for indexing/math
+        gen_arr = np.array(self.generation_history)
+        rew_arr = np.array(self.reward_history) # Shape: (Gen, 3)
+        loss_arr = np.array(self.total_loss_history)
+
+        # Clear axes
+        for a in self.ax: a.clear()
+
+        # --- 1. REWARD PLOT ---
+        # Plot individual player rewards (Red, transparent)
+        if rew_arr.ndim > 1:
+            for p in range(rew_arr.shape[1]):
+                self.ax[0].plot(gen_arr, rew_arr[:, p], color='red', alpha=0.15)
+            # Bold Line: Mean of all players
+            mean_rew = np.mean(rew_arr, axis=1)
         else:
-            self.generation_history = np.append(self.generation_history, generation)
-            self.reward_history = np.append(self.reward_history, [reward], axis = 0)
-            self.total_loss_history = np.append(self.total_loss_history, [total_loss], axis = 0)
-            self.lr_history =  np.append(self.lr_history, [lr], axis = 0)
-            self.entropy_history = np.append(self.entropy_history, [entropy], axis = 0)
-            self.stalemate_history = np.append(self.stalemate_history, [stalemate_rate], axis = 0)
+            mean_rew = rew_arr
+            
+        self.ax[0].plot(gen_arr, mean_rew, color='red', alpha=0.3, label='Raw Batch Mean')
+        
+        # Smoothed line (Window of 10)
+        if len(mean_rew) > self.smooth_win:
+            smoothed = np.convolve(mean_rew, np.ones(self.smooth_win)/self.smooth_win, mode='valid')
+            self.ax[0].plot(gen_arr[self.smooth_win-1:], smoothed, color='red', linewidth=2, label='Smoothed')
+            
+        self.ax[0].set_title('Total Reward')
+        self.ax[0].legend(loc='upper left')
 
-        if len(self.generation_history) >= 5:
-            self.smoothed_reward.pop(0)
-            self.smoothed_loss.pop(0)
-        self.smoothed_reward.append(np.mean(self.reward_history[-5:], axis=0))
-        self.smoothed_loss.append(np.mean(self.total_loss_history[-5:], axis=0))
+        # --- 2. LOSS PLOT ---
+        self.ax[1].plot(gen_arr, loss_arr, color='blue', alpha=0.3)
+        if len(loss_arr) > self.smooth_win:
+            smoothed_l = np.convolve(loss_arr, np.ones(self.smooth_win)/self.smooth_win, mode='valid')
+            self.ax[1].plot(gen_arr[self.smooth_win-1:], smoothed_l, color='blue', linewidth=2)
+        
+        self.ax[1].set_title('Total Loss')
 
-        self.ax[0].clear()
-        self.ax[1].clear()
-        self.ax[2].clear()
-        for i in range(len(reward)):
-            self.ax[0].plot(self.generation_history, self.reward_history[:,i], color = 'red', alpha = 0.3)
-        self.ax[0].plot(self.generation_history[-len(self.smoothed_reward):], self.smoothed_reward, color='red', linewidth=2)
-        self.ax[0].set_xlabel('Generation')
-        self.ax[0].set_ylabel('Total Reward')
-        self.ax[0].set_title('Training Progress - Total Reward')
-        self.ax[0].grid(True)
-
-        self.ax[1].plot(self.generation_history, self.total_loss_history, color = 'blue', alpha = 0.3)
-        self.ax[1].plot(self.generation_history[-len(self.smoothed_loss):], self.smoothed_loss, color='blue', linewidth=2)
-        self.ax[1].set_xlabel('Generation')
-        self.ax[1].set_ylabel('Loss')
-        self.ax[1].set_title('Training Progress - Loss')
-        self.ax[1].grid(True)
-
-        self.ax[2].plot(self.generation_history, self.lr_history, label='Learning Rate', color='green')
-        self.ax[2].plot(self.generation_history, self.entropy_history, label='Entropy Coefficient', color='orange')
-        self.ax[2].plot(self.generation_history, self.stalemate_history, label='Stalemate Rate', color='purple')
+        # --- 3. LOG SCALE METRICS ---
+        self.ax[2].plot(gen_arr, self.lr_history, label='LR', color='green')
+        self.ax[2].plot(gen_arr, self.entropy_history, label='Entropy Coeff', color='orange')
+        self.ax[2].plot(gen_arr, self.stalemate_history, label='Stalemate Rate', color='purple')
+        
         self.ax[2].set_yscale('log')
-        self.ax[2].set_xlabel('Generation')
-        self.ax[2].set_ylabel('Value')
-        self.ax[2].legend()
-        self.ax[2].grid(True)
+        self.ax[2].set_title('Training Hyperparameters (Log Scale)')
+        self.ax[2].legend(loc='upper right')
 
+        # Formatting
+        for a in self.ax: a.grid(True, which='both', linestyle='--', alpha=0.5)
+        plt.tight_layout()
         plt.draw()
-        plt.pause(0.001)
+        plt.pause(0.01)
 # endregion
 
 # region Functions
@@ -126,7 +136,7 @@ def plot_batch_status(env, fig, ax):
     plt.draw()
     plt.pause(0.001)
 
-def save_best_player(model, filename = 'Palace_king.pth'):
+def save_best_player(model, filename = 'temporary_king.pth'):
     torch.save(model.state_dict(), filename)
     print(f"Model saved to {filename}")
 
@@ -461,7 +471,7 @@ try:
         print(f"Generation {generation} completed.")
         print(f"Loss = {total_loss:.4f}, \nLR={current_lr:.6f}, \nEntropy Coef={current_ent_coef:.4f}, \nStalemate Rate={stalemate_rate:.4f}")
         print(f"Mean Turns Taken: {player_counters.sum(dim=0).float().mean().item():.2f}")
-        print(f"Level Distribution Probabilities: {current_level_probs}")
+        print(f"Level Distribution Probabilities: {current_level_probs:.2f}")
         print("="*50 + "\n")
         
         # b_rew shape: (NumPlayers, BatchSize, MaxTurns)
@@ -484,7 +494,7 @@ try:
             stalemate_rate = stalemate_rate,
         )
 
-        if generation % 20 == 0:
+        if generation % 20 == 0 and generation > 0:
             # region Player Evaluation
             print(f"Evaluating generation {generation} players against current best...")
             

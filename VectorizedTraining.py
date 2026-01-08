@@ -6,6 +6,7 @@ import copy
 import matplotlib.pyplot as plt
 import cProfile
 import pstats
+import time
 
 from VectorizedCardGame import PalaceEnv
 from PalacePlayer import PalacePlayer
@@ -36,6 +37,8 @@ class LivePlot:
         self.total_loss_history = None
         self.entropy_history = None
         self.stalemate_history = None
+        self.smoothed_reward = []
+        self.smoothed_loss = []
 
         self.fig, self.ax = plt.subplots(3, 1, figsize=(15, 10))
 
@@ -55,20 +58,25 @@ class LivePlot:
             self.entropy_history = np.append(self.entropy_history, [entropy], axis = 0)
             self.stalemate_history = np.append(self.stalemate_history, [stalemate_rate], axis = 0)
 
+        if len(self.generation_history) >= 5:
+            self.smoothed_reward.pop(0)
+            self.smoothed_loss.pop(0)
+        self.smoothed_reward.append(np.mean(self.reward_history[-5:], axis=0))
+        self.smoothed_loss.append(np.mean(self.total_loss_history[-5:], axis=0))
+
         self.ax[0].clear()
         self.ax[1].clear()
         self.ax[2].clear()
         for i in range(len(reward)):
-            if i == 0:
-                self.ax[0].plot(self.generation_history, self.reward_history[:,i], color = 'red', alpha = 1.0)
-            else:
-                self.ax[0].plot(self.generation_history, self.reward_history[:,i], color = 'red', alpha = 0.3)
+            self.ax[0].plot(self.generation_history, self.reward_history[:,i], color = 'red', alpha = 0.3)
+        self.ax[0].plot(self.generation_history[-len(self.smoothed_reward):], self.smoothed_reward, color='red', linewidth=2)
         self.ax[0].set_xlabel('Generation')
         self.ax[0].set_ylabel('Total Reward')
         self.ax[0].set_title('Training Progress - Total Reward')
         self.ax[0].grid(True)
 
-        self.ax[1].plot(self.generation_history, self.total_loss_history, color = 'blue')
+        self.ax[1].plot(self.generation_history, self.total_loss_history, color = 'blue', alpha = 0.3)
+        self.ax[1].plot(self.generation_history[-len(self.smoothed_loss):], self.smoothed_loss, color='blue', linewidth=2)
         self.ax[1].set_xlabel('Generation')
         self.ax[1].set_ylabel('Loss')
         self.ax[1].set_title('Training Progress - Loss')
@@ -135,14 +143,20 @@ def create_static_input_vector(env):
     #2. other players' states
     for offset in range(1, env.num_players):
         other_players = (current_players + offset) % env.num_players
-        other_hands = env.hands[batch_ids, other_players, :]  # (B, 13)
+        other_hands = env.hands[batch_ids, other_players, :].sum(dim=1, keepdim=True)  # (B, 1)
         other_faceup = env.face_up_piles[batch_ids, other_players, :]  # (B, 13)
         other_facedown_len = env.face_down_piles[batch_ids, other_players, :].sum(dim=1, keepdim=True)  # (B, 1)
         parts.extend([other_hands, other_faceup, other_facedown_len])
 
     #3. Draw pile length
-    drawpile_len = env.drawpile_counts.sum(dim=1, keepdim=True).float()
-    parts.append(drawpile_len)
+    discard_counts = env.discard_counts.float()  # (B, 13)
+    parts.append(discard_counts)
+
+    #4. Global States
+    top_cards = env.top_cards.unsqueeze(1).float()  # (B, 1)
+    run_counts = env.run_count.unsqueeze(1).float()  # (B, 1)
+    drawpile_len = env.drawpile_counts.sum(dim=1, keepdim=True).float() # (B, 1)
+    parts.extend([top_cards, run_counts, drawpile_len])
 
     return torch.cat(parts, dim = 1).float()  # (B, 82)
 
@@ -194,7 +208,7 @@ def finish_batch_update(optimizer, b_lp, b_ent, b_rew, b_counters, ent_coef, kin
 
     return 0.0 # Return the device tensor
 
-def training_step(players, best_player_weights, batch_size, sequence_length):
+def training_step(players, best_player_weights, batch_size, sequence_length, level_wins, level_counts, current_level_probs):
 
     env = PalaceEnv(batch_size = batch_size, num_players = 3, device = device)
     if best_player_weights is not None:
@@ -203,7 +217,7 @@ def training_step(players, best_player_weights, batch_size, sequence_length):
     for i in range(1, env.num_players):
         players[i].train()
 
-    env.reset(players)
+    current_levels = env.reset(players, levels = current_level_probs)
     active_envs = torch.ones(batch_size, dtype=torch.bool, device=device)
 
     shape = (env.num_players, batch_size, env.max_turns)
@@ -292,7 +306,32 @@ def training_step(players, best_player_weights, batch_size, sequence_length):
 
     pbar_batch.close()
 
-    return buffer_lp, buffer_rew, buffer_ent, player_step_counters, stalemate_rate
+    for lvl in range(4):
+        lvl_mask = (current_levels == lvl)
+        level_counts[lvl] += lvl_mask.sum().item()
+        level_wins[lvl] += (lvl_mask & (env.done & ~env.stalemates)).sum().item()
+
+    return buffer_lp, buffer_rew, buffer_ent, player_step_counters, stalemate_rate, level_wins, level_counts
+
+def update_level_distribution(wins, counts, current_probs):
+    win_rates = wins / (counts + 1e-8)
+    new_probs = list(current_probs)
+    threshold = 0.70 # if win rate is greater than this, then
+    shift_amount = 0.05 # shift this much towards next hardest level
+
+    if win_rates[3] > threshold and new_probs[3] > 0.05:
+        new_probs[3] -= shift_amount
+        new_probs[2] += shift_amount
+    if win_rates[2] > threshold and new_probs[2] > 0.05:
+        new_probs[2] -= shift_amount
+        new_probs[1] += shift_amount
+    if win_rates[1] > threshold and new_probs[1] > 0.05:
+        new_probs[1] -= shift_amount
+        new_probs[0] += shift_amount
+
+    # Normalize
+    total = sum(new_probs)
+    return [p / total for p in new_probs]
 
 def evaluate_players(players, num_games = 100, sequence_length = 12, max_turns = 1000):
     # num_games acts as our batch_size for evaluation
@@ -357,13 +396,13 @@ num_generations = 3000
 batch_size = 256
 
 initial_lr = 1e-2
-lr_decay = 0.99
+lr_decay = 0.999
 final_lr = 1e-5
 current_lr = initial_lr
 
 initial_entropy_coef = 0.1
 final_entropy_coef = 0.005
-ent_decay = 0.95
+ent_decay = 0.99
 current_ent_coef = initial_entropy_coef
 
 last_king_loss = 0.0
@@ -375,13 +414,23 @@ players = [shared_player for _ in range(3)]
 
 best_player_weights = None
 
+level_wins = torch.zeros(4, device = device)
+level_counts = torch.zeros(4, device = device)
+current_level_probs = [0.0, 0.0, 0.0, 1.0] # start all at level 3
+
 # profiler = cProfile.Profile()
 # profiler.enable()
 
 try:
+    
     for generation in range(num_generations):
+        start_time = time.perf_counter()
+
         # Prepare players for this generation
-        b_lp, b_rew, b_ent, player_counters, stalemate_rate = training_step(players, best_player_weights, batch_size, sequence_length)
+        b_lp, b_rew, b_ent, player_counters, stalemate_rate, level_wins, level_counts = training_step(players, best_player_weights, batch_size, sequence_length, level_wins, level_counts, current_level_probs)
+
+        # Update level distribution based on performance
+        current_level_probs = update_level_distribution(level_wins.cpu().numpy(), level_counts.cpu().numpy(), current_level_probs)
 
         # Update using the accumulated batch data
         print("Calculating and backpropagating loss...")
@@ -392,8 +441,19 @@ try:
             king_available=(best_player_weights is not None)
         )           
 
-        current_ent_coef = max(final_entropy_coef, current_ent_coef * ent_decay) if stalemate_rate < 0.3 else initial_entropy_coef * ent_decay**(generation//10)
-        current_lr = max(final_lr, current_lr * lr_decay) if stalemate_rate < 0.3 else initial_lr * lr_decay**(generation//10)
+        if stalemate_rate > 0.3:
+            current_lr = min(initial_lr, current_lr * 1.5)
+            current_ent_coef = min(initial_entropy_coef, current_ent_coef * 1.5)
+        else:
+            current_ent_coef = max(final_entropy_coef, current_ent_coef * ent_decay)
+            current_lr = max(final_lr, current_lr * lr_decay)
+
+        if generation % 500 == 0 and generation > 0:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = initial_lr
+
+            current_ent_coef = min(initial_entropy_coef, current_ent_coef * 10)
+
         for param_group in optimizer.param_groups:
             param_group['lr'] = current_lr
 
@@ -401,6 +461,7 @@ try:
         print(f"Generation {generation} completed.")
         print(f"Loss = {total_loss:.4f}, \nLR={current_lr:.6f}, \nEntropy Coef={current_ent_coef:.4f}, \nStalemate Rate={stalemate_rate:.4f}")
         print(f"Mean Turns Taken: {player_counters.sum(dim=0).float().mean().item():.2f}")
+        print(f"Level Distribution Probabilities: {current_level_probs}")
         print("="*50 + "\n")
         
         # b_rew shape: (NumPlayers, BatchSize, MaxTurns)
@@ -443,9 +504,12 @@ try:
             print(f"Loss history: {loss_history}")
             # endregion
 
-    save_best_player(players[0], filename='Palace_king.pth')
+        end_time = time.perf_counter()
+        print(f"Generation {generation} took {end_time - start_time:.2f} seconds.\n")
+
+    save_best_player(players[0], filename='temporary_king.pth')
     # Save figure
-    plt.savefig('training_progress.png')
+    
 
 except KeyboardInterrupt:
     print("\n[INTERRUPT] Training paused by user. Saving current models...")
@@ -454,11 +518,13 @@ except KeyboardInterrupt:
     torch.save(players[1].state_dict(), "learner_interrupted.pt")
     
     # Save the King (the current best performer)
-    if best_player_weights is not None:
-        save_best_player(players[0], filename='Palace_king.pth')
-        
+    save_best_player(players[0], filename='temporary_king.pth')
     print("Models saved successfully. Exiting.")
 
+    plt.savefig('training_progress.png')
+
 # profiler.disable()
-stats = pstats.Stats(profiler).sort_stats('cumtime')
-stats.print_stats(20)
+# stats = pstats.Stats(profiler).sort_stats('cumtime')
+# stats.print_stats(20)
+
+plt.savefig('training_progress.png')

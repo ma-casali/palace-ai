@@ -5,18 +5,18 @@ from PalacePlayer import PalacePlayer
 
 REWARD_CONFIG = {
     # Frequency/Urgency
-    'step_penalty': -0.05,
+    'step_penalty': -0.1,
     'pickup_penalty_per_card': -0.1,
     'stalemate_penalty': -20.0,
 
     # Hand management
-    'card_played_base': 0.1,
+    'card_played_base': 0.2,
     'per_card_bonus': 0.02,
-    'hand_size_penalty': -0.005,
+    'hand_size_penalty': -0.1,
 
     # Game Milestones
-    'burn_pile_bonus': 1.0,
-    'pickup_base_penalty': -0.2,
+    'burn_pile_bonus': 2.0,
+    'pickup_base_penalty': -0.05,
     'pickup_per_card_penalty': -0.02,
     'facedown_milestone_bonus': 1.0,
     'faceup_milestone_bonus': 1.0,
@@ -31,7 +31,10 @@ REWARD_CONFIG = {
     'played_two': 0.1,
     'played_three': 0.5,
     'played_seven': 0.3,
-    'played_ten': 0.7
+    'played_ten': 0.7,
+
+    # Other rewards/penalties
+    'forced_pickup': 0.5
 }
 
 class PalaceEnv:
@@ -51,7 +54,7 @@ class PalaceEnv:
         # other piles (1, batch_size)
         self.discard_counts = torch.zeros((batch_size, 13), dtype=torch.long, device=device)
         self.top_cards = -torch.ones(batch_size, dtype=torch.long, device=device) # -1 means empty discard pile
-        self.drawpile_counts = 4*torch.ones((batch_size, 13), dtype=torch.long, device=device)
+        self.drawpile_counts = torch.zeros((batch_size, 13), dtype=torch.float32, device=device)
         self.run_ranks = -1*torch.ones((batch_size,), dtype=torch.long, device=device)
         self.run_count = torch.zeros((batch_size,), dtype=torch.long, device=device)
 
@@ -61,22 +64,30 @@ class PalaceEnv:
         self.done = torch.zeros(batch_size, dtype = torch.bool, device = device)
         self.stalemates = torch.zeros(batch_size, dtype = torch.bool, device = device)
 
-    def reset(self, players):
+    def reset(self, players, levels = [1.0, 0.0, 0.0, 0.0]):
+        """
+        level 0: standard game (start from beginning)
+        level 1: noisy draw pile, 3 cards in hand
+        level 2: noisy draw pile, 0 cards in hand, face-up piles only
+        level 3: noisy draw pile, 0 cards in hand, face-down piles only
+        """
         self.turn_counts.fill_(0)
         self.hands.fill_(0)
         self.face_up_piles.fill_(0)
         self.face_down_piles.fill_(0)
         self.discard_counts.fill_(0)
         self.top_cards.fill_(-1)
-        self.drawpile_counts.fill_(4)
+        self.drawpile_counts.fill_(0)
         self.run_ranks.fill_(-1)
         self.run_count.fill_(0)
         self.active_players.fill_(0)
         self.players_out.fill_(-1)
         self.done.fill_(False)
         self.stalemates.fill_(False)
-
         self.players = players
+
+        level_distribution = torch.tensor(levels, device=self.device)
+        levels = torch.multinomial(level_distribution, self.batch_size, replacement=True)
 
         base_deck = torch.arange(13, device=self.device).repeat(4)
         all_decks = base_deck.unsqueeze(0).repeat(self.batch_size, 1)
@@ -93,16 +104,46 @@ class PalaceEnv:
             self.face_up_piles[:, p].scatter_add_(1, faceup_ranks, torch.ones_like(faceup_ranks, dtype=torch.long))
             self.hands[:, p].scatter_add_(1, hand_ranks, torch.ones_like(hand_ranks, dtype=torch.long))
 
-        # store the remaining cards in the draw pile
         remaining_deck = all_decks[:, self.num_players * 9:]
-        self.drawpile_counts.scatter_add_(1, remaining_deck, torch.ones_like(remaining_deck, dtype=torch.long))
+        num_remaining = remaining_deck.shape[1]
+
+        # store the remaining cards in the draw pile
+        l0_mask = (levels == 0)
+        hi_mask = (levels >= 1)
+        l2_mask = (levels >= 2)
+        l3_mask = (levels >= 3)
+        if l0_mask.any():
+            l0_cards = remaining_deck[l0_mask]
+            self.drawpile_counts[l0_mask].scatter_add_(1, l0_cards, torch.ones_like(l0_cards, dtype=torch.float32))
+        elif hi_mask.any():
+            num_hi = hi_mask.sum().item()
+            draw_count = torch.randint(0, 10, (num_hi,), device=self.device) # how many cards to put in draw pile
+
+            range_tensor = torch.arange(num_remaining, device=self.device).expand(num_hi, num_remaining)
+            keep_mask = range_tensor < draw_count.unsqueeze(1)
+
+            hi_decks = remaining_deck[hi_mask]
+            valid_ranks = hi_decks[keep_mask]
+
+            batch_ids = torch.where(hi_mask)[0]
+            valid_batches = batch_ids.unsqueeze(1).expand(-1, num_remaining)[keep_mask]
+
+            flat_idx = valid_batches.long() * 13 + valid_ranks.long()
+            source_ones = torch.ones(valid_ranks.shape[0], device=self.device, dtype=torch.float32)
+            self.drawpile_counts.view(-1).index_add_(0, flat_idx, source_ones)
+
+        self.hands[l2_mask] = 0
+        self.face_up_piles[l3_mask] = 0
+    
+        return levels
 
     def step(self, actions):
         
         # actions: Tensor (batch_size, ) where each values is 0-78
         cfg = REWARD_CONFIG
         rewards = torch.zeros((self.batch_size, self.num_players), device = self.device)
-        rewards += cfg['step_penalty']
+        penalty = cfg['step_penalty'] * (1.0 + self.turn_counts.float() / 100.0)
+        rewards += penalty.unsqueeze(1)
         batch_ids = torch.arange(self.batch_size, device=self.device)
         active_hand_sizes = (
             self.hands[batch_ids, self.active_players].sum(dim=1) + 
@@ -114,27 +155,17 @@ class PalaceEnv:
         card_ranks = actions % 13
         action_categories = actions // 13
         
+        # region PLAY FROM HAND OR FACE-UP LOGIC
         played_two   = (card_ranks == 0) & (actions < 78)
         played_three = (card_ranks == 1) & (actions < 78)
         played_seven = (card_ranks == 5) & (actions < 78)
         played_ten   = (card_ranks == 8) & (actions < 78)
 
         # Multiplier is (action_categories + 1) to account for number of cards played
-        if played_two.any():
-            mult = action_categories[played_two] + 1
-            rewards[played_two, self.active_players[played_two]] += cfg['played_two'] * mult
-      
-        if played_three.any():
-            mult = action_categories[played_three] + 1
-            rewards[played_three, self.active_players[played_three]] += cfg['played_three'] * mult
-            
-        if played_seven.any():
-            mult = action_categories[played_seven] + 1
-            rewards[played_seven, self.active_players[played_seven]] += cfg['played_seven'] * mult
-            
-        if played_ten.any():
-            mult = action_categories[played_ten] + 1
-            rewards[played_ten, self.active_players[played_ten]] += cfg['played_ten'] * mult
+        rewards += (played_two.float() * cfg['played_two'] * (action_categories.float() + 1)).unsqueeze(1)
+        rewards += (played_three.float() * cfg['played_three'] * (action_categories.float() + 1)).unsqueeze(1)
+        rewards += (played_seven.float() * cfg['played_seven'] * (action_categories.float() + 1)).unsqueeze(1)
+        rewards += (played_ten.float() * cfg['played_ten'] * (action_categories.float() + 1)).unsqueeze(1)
 
         rewards[actions < 78, self.active_players[actions < 78]] += cfg['card_played_base'] + cfg['per_card_bonus'] * (torch.where(action_categories[actions < 78] + 1 <= 4, action_categories[actions < 78] + 1, 1))
         num_cards_played = torch.zeros(self.batch_size, dtype=torch.long, device=self.device)
@@ -147,12 +178,15 @@ class PalaceEnv:
         self.run_count = torch.where(run_match, self.run_count + num_cards_played, num_cards_played)
         self.run_ranks = card_ranks
 
-        # PLAY FROM HAND OR FACE-UP LOGIC
-        self.hands[batch_ids, self.active_players, card_ranks] -= torch.where(actions < 52, action_categories + 1, 0)
-        self.face_up_piles[batch_ids, self.active_players, card_ranks] -= torch.where((actions >= 52) & (actions < 65), 1, 0)
+        # take counts from hands/face-up piles and place on discard pile/make top card
+        play_from_hand_mask = (actions < 52)
+        play_from_faceup_mask = (actions >= 52) & (actions < 65)
+        self.hands[play_from_hand_mask, self.active_players[play_from_hand_mask], card_ranks[play_from_hand_mask]] -= action_categories[play_from_hand_mask] + 1
+        self.face_up_piles[play_from_faceup_mask, self.active_players[play_from_faceup_mask], card_ranks[play_from_faceup_mask]] -= 1
         rewards[(actions >= 52) & (actions < 65), self.active_players[(actions >= 52) & (actions < 65)]] += cfg['faceup_milestone_bonus']
+        # endregion
 
-        # FACEDOWN LOGIC
+        # region FACEDOWN LOGIC
         facedown_mask = (actions // 13 == 5) & (self.face_down_piles[batch_ids, self.active_players].sum(dim = 1) > 0)
         if facedown_mask.any():
             rewards[facedown_mask, self.active_players[facedown_mask]] += cfg['facedown_milestone_bonus']
@@ -180,24 +214,32 @@ class PalaceEnv:
                 self.discard_counts[success_batch_ids, chosen_ranks[~is_fail]] += 1
                 self.top_cards[success_batch_ids] = chosen_ranks[~is_fail]
                 rewards[success_batch_ids, self.active_players[success_batch_ids]] += cfg['card_played_base'] + cfg['per_card_bonus']
+        # endregion
 
-        # PICKUP LOGIC 
+        # region PICKUP LOGIC 
         pickup_mask = (actions == 78)
-        if pickup_mask.any():
-            trapped_by_three = pickup_mask & (self.top_cards == 1)
-            if trapped_by_three.any():
-                self.discard_counts[trapped_by_three, 1] -= 1
-                self.discard_counts = torch.clamp(self.discard_counts, min=0)
-            
-            self.hands[pickup_mask, self.active_players[pickup_mask]] += self.discard_counts[pickup_mask]
-            self.discard_counts[pickup_mask] = torch.zeros_like(self.discard_counts[pickup_mask])
-            self.top_cards[pickup_mask] = -1
-            self.run_ranks[pickup_mask] = -1
-            self.run_count[pickup_mask] = 0
-            rewards[pickup_mask, self.active_players[pickup_mask]] += cfg['pickup_base_penalty'] + cfg['pickup_per_card_penalty'] * self.discard_counts[pickup_mask].sum(dim=1)
-            rewards[pickup_mask, self.active_players[pickup_mask]] += cfg['hand_size_penalty'] * self.hands[pickup_mask, self.active_players[pickup_mask]].sum(dim=1)
 
-        # DRAW CARDS IF NEEDED (UP TO 3)
+        trapped_by_three = pickup_mask & (self.top_cards == 1)
+        self.discard_counts[trapped_by_three, 1] = 0
+        self.discard_counts = torch.clamp(self.discard_counts, min=0)
+        
+        # pickup penalty before zeroing out discard pile
+        pickup_penalty = cfg['pickup_base_penalty'] + cfg['pickup_per_card_penalty'] * self.discard_counts.sum(dim=1)
+        
+        self.hands[pickup_mask, self.active_players[pickup_mask]] += self.discard_counts[pickup_mask]
+        self.discard_counts[pickup_mask] = torch.zeros_like(self.discard_counts[pickup_mask])
+        self.top_cards[pickup_mask] = -1
+        self.run_ranks[pickup_mask] = -1
+        self.run_count[pickup_mask] = 0
+        rewards[pickup_mask, self.active_players[pickup_mask]] += pickup_penalty[pickup_mask]
+        rewards[pickup_mask, self.active_players[pickup_mask]] += cfg['hand_size_penalty'] * self.hands[pickup_mask, self.active_players[pickup_mask]].sum(dim=1)
+        
+        only_pickup_available = pickup_mask & (self.get_valid_mask().sum(dim=1) == 1)
+        rewards[only_pickup_available, (self.active_players[only_pickup_available] - 1) % self.num_players] += cfg['forced_pickup']
+        
+        # endregion
+
+        # region DRAW CARDS IF NEEDED (UP TO 3)
         current_hand_totals = self.hands[torch.arange(self.batch_size), self.active_players].sum(dim = 1)
         missing_counts = torch.clamp(3 - current_hand_totals, min = 0)
         can_draw = (missing_counts > 0) & (self.drawpile_counts[batch_ids].sum(dim = 1) > 0)
@@ -233,8 +275,9 @@ class PalaceEnv:
                         self.players_out[idx, slots[0]] = p
                         # Optional: Give reward to that specific player
                         rewards[idx, p] += cfg['win_reward'] + cfg['card_difference_bonus_rate'] * (self.num_players * 9 - (self.hands[idx].sum() + self.face_up_piles[idx].sum() + self.face_down_piles[idx].sum()))
+        # endregion
 
-        # GLOBAL DONE CHECK
+        # region GLOBAL DONE CHECK
         # A game is done if (num_players - 1) players have finished
         players_finished_count = (self.players_out != -1).sum(dim=1)
         newly_done = (players_finished_count >= self.num_players - 1) & ~self.done
@@ -248,22 +291,23 @@ class PalaceEnv:
                 out_list = self.players_out[i].tolist()
                 loser_id = next(p for p in range(self.num_players) if p not in out_list)
                 rewards[i, loser_id] += cfg['lose_penalty'] + cfg['card_difference_penalty_rate'] * (self.hands[i].sum() + self.face_up_piles[i].sum() + self.face_down_piles[i].sum())
+        # endregion
 
+        # region UPDATE DISCARD PILE COUNTS AND TOP CARDS
         # add cards to discard piles, unless 10 (clear) or pickup
         not_pickup = (actions != 78)
-        if not_pickup.any():
-            self.discard_counts[not_pickup].scatter_add_(
-                1,
-                card_ranks[not_pickup].unsqueeze(1),
-                num_cards_played[not_pickup].unsqueeze(1)
-            )
+        self.discard_counts.scatter_add_(
+            1,
+            card_ranks.unsqueeze(1),
+            (num_cards_played * not_pickup).unsqueeze(1)
+        )
         self.top_cards = torch.where(not_pickup, card_ranks, torch.tensor(-1, device=self.device))
+        # endregion
 
-        # ROTATE TO NEXT PLAYER
+        # region ROTATE TO NEXT PLAYER
         is_burn = (card_ranks == 8) | (self.run_count >= 4)
-
-        new_player = (self.active_players + 1) % self.num_players
-        self.active_players = torch.where(~is_burn, new_player, self.active_players)
+        
+        self.active_players = torch.where(is_burn, self.active_players, (self.active_players + 1) % self.num_players)
 
         for _ in range(self.num_players - 1):
             still_active_mask = ~self.done
@@ -272,22 +316,30 @@ class PalaceEnv:
             if not to_shift.any(): 
                 break
             self.active_players[to_shift] = (self.active_players[to_shift] + 1) % self.num_players
+        # endregion
 
-        self.discard_counts = torch.where(is_burn.unsqueeze(1),
-                                          torch.zeros_like(self.discard_counts),
-                                          self.discard_counts)
-        self.top_cards[pickup_mask] = -1
-        self.run_ranks[pickup_mask] = -1
-        self.run_count[pickup_mask] = 0
+        # region EXECUTE BURN
+        self.discard_counts[pickup_mask | is_burn] = 0
+        self.top_cards[pickup_mask | is_burn] = -1
+        self.run_ranks[pickup_mask | is_burn] = -1
+        self.run_count[pickup_mask | is_burn] = 0
+        # endregion
 
-        # STALEMATE CHECK
+        # region STALEMATE CHECK
         self.turn_counts += (~self.done).long()
         reached_limit = (self.turn_counts) >= self.max_turns
         stalemate_mask = reached_limit & (~self.done)
         if stalemate_mask.any():
-            rewards[stalemate_mask, :] += cfg['stalemate_penalty']
+            total_cards = self.hands.sum(dim=2) + self.face_up_piles.sum(dim=2) + self.face_down_piles.sum(dim=2)
+            is_still_in = (total_cards > 0)
+            
+            involved_players = stalemate_mask.unsqueeze(1) & is_still_in
+
+            rewards[involved_players] += cfg['stalemate_penalty']
+
             self.done[stalemate_mask] = True
             self.stalemates[stalemate_mask] = True
+        # endregion
             
         return rewards, self.done
 

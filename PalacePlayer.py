@@ -2,7 +2,7 @@ from torch import nn
 import torch
 
 class PalacePlayer(nn.Module):
-    def __init__(self, history_dim = 79, static_dim = 82, hidden_dim = 64, num_rnn_layers = 2):
+    def __init__(self, history_dim = 79, static_dim = 73, hidden_dim = 64, num_rnn_layers = 2):
         super(PalacePlayer, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_rnn_layers = num_rnn_layers

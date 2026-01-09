@@ -112,10 +112,19 @@ class PalaceEnv:
         hi_mask = (levels >= 1)
         l2_mask = (levels >= 2)
         l3_mask = (levels >= 3)
+
         if l0_mask.any():
+            l0_batch_indices = torch.where(l0_mask)[0]
+            num_l0 = l0_batch_indices.shape[0]
             l0_cards = remaining_deck[l0_mask]
-            self.drawpile_counts[l0_mask].scatter_add_(1, l0_cards, torch.ones_like(l0_cards, dtype=torch.float32))
-        elif hi_mask.any():
+            num_cards_in_draw = l0_cards.shape[1]
+            batch_coords = l0_batch_indices.unsqueeze(1).expand(-1, num_cards_in_draw).contiguous().view(-1)
+            flat_idx = (batch_coords.long() * 13 + l0_cards.view(-1).long())
+            flat_idx = flat_idx.reshape(-1)
+            source_ones = torch.ones(flat_idx.shape[0], device=self.device, dtype=torch.float32)
+            self.drawpile_counts.view(-1).index_add_(0, flat_idx, source_ones)
+            
+        if hi_mask.any():
             num_hi = hi_mask.sum().item()
             draw_count = torch.randint(0, 10, (num_hi,), device=self.device) # how many cards to put in draw pile
 

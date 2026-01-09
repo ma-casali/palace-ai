@@ -128,7 +128,6 @@ class MultiGameLogger:
         lines.append("="*70 + "\n")
         return "\n".join(lines)
 
-
 def play_kings_against_kings(king_path):
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     batch_size = 256
@@ -206,21 +205,16 @@ def play_kings_against_kings(king_path):
     logger.save_stalemate_log(env.done, "stalemate_analysis.txt")
 
 def play_against_kings(king_path):
-
-    # SET UP ENVIRONMENT AND MODEL
+    # ... [Keep environment and model setup as you have it] ...
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     batch_size = 1
-    env = PalaceEnv(batch_size=batch_size, num_players = 3, device=device)
-
-    # load in the king player
+    env = PalaceEnv(batch_size=batch_size, num_players=3, device=device)
+    
     king_model = PalacePlayer().to(device)
     king_model.load_state_dict(torch.load(king_path, map_location=device))
     king_model.eval()
 
-    # initialize action history (one-hot encoded)
     action_history = torch.zeros((batch_size, 6, 79), device=device)
-
-    # initialize LSTM hidden states for all 3
     hidden_states = {
         p: (torch.zeros(2, batch_size, king_model.hidden_dim, device=device),
             torch.zeros(2, batch_size, king_model.hidden_dim, device=device))
@@ -228,100 +222,104 @@ def play_against_kings(king_path):
     }
 
     players = [king_model for _ in range(3)]
-    env.reset(players)
+    env.reset(players, levels=[1.0, 0.0, 0.0, 0.0])
 
     rank_names = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
+    category_names = ["Single", "Pair", "Three", "Four", "Face-Up", "Face-Down"]
 
-    # PLAY THE GAME
-    print(f"{Fore.GREEN}Game start! You are Player 0.{Style.RESET_ALL}")
+    print(f"\n{Fore.GREEN}{'='*50}\n   WELCOME TO PALACE: HUMAN VS KINGS\n{'='*50}{Style.RESET_ALL}")
 
-    total_rewards = torch.zeros((batch_size, 3), device=device)
-    with torch.no_grad(): # static weights
-        while not env.done.all(): # play until the game is done
+    with torch.no_grad():
+        while not env.done.all():
             current_player = env.active_players[0].item()
 
-            if current_player == 0: # the user
-                print(f"\n{Fore.CYAN}" + "="*30)
-                print("Draw pile cards remaining:", env.drawpile_counts[0].sum().item())
+            if current_player == 0:
+                print(f"\n{Fore.WHITE}{Style.BRIGHT}--- BOARD STATE ---{Style.RESET_ALL}")
+                
+                # Table Info
                 top_card_idx = env.top_cards[0].item()
-                top_card_name = rank_names[top_card_idx % 13] if top_card_idx >= 0 else "None"
-                card_amount = env.discard_counts[0].sum().item() if env.discard_counts[0].sum().item() > 0 else 0
-                print(f"Top card on {card_amount}-card pile: {top_card_name} with run count {env.run_count[0].item()}")
+                top_card_name = rank_names[top_card_idx % 13] if top_card_idx >= 0 else "Empty"
+                pile_count = int(env.discard_counts[0].sum().item())
+                draw_count = int(env.drawpile_counts[0].sum().item())
+                
+                print(f"Draw Pile: [{Fore.YELLOW}{draw_count}{Style.RESET_ALL}] cards left")
+                print(f"Current Pile: {Fore.CYAN}{top_card_name}{Style.RESET_ALL} (x{env.run_count[0].item()}) | Pile size: {pile_count}")
+                
+                # Opponent Status (Structured)
+                print(f"\n{Fore.WHITE}OPPONENTS:{Style.RESET_ALL}")
+                for opp in [1, 2]:
+                    h_count = int(env.hands[0, opp].sum())
+                    fu_cards = [rank_names[i] for i in range(13) if env.face_up_piles[0, opp, i] > 0]
+                    fd_count = int(env.face_down_piles[0, opp].sum())
+                    print(f" P{opp}: Hand[{h_count}] | Face-Up{fu_cards} | Face-Down[{fd_count}]")
 
-                print(f"Your Hand: {[f'{rank_names[i]} (x{int(env.hands[0,0,i])})' for i in range(13) if env.hands[0,0,i] > 0]}")
-                print(f"Face-Up:   {[f'{rank_names[i]} (x{int(env.face_up_piles[0,0,i])})' for i in range(13) if env.face_up_piles[0,0,i] > 0]}")
-                print(f"Face-Down: {'x ' * int(env.face_down_piles[0, 0].sum())}")
+                # Your Hand
+                print(f"\n{Fore.GREEN}{Style.BRIGHT}YOUR CARDS:{Style.RESET_ALL}")
+                my_hand = [f"{rank_names[i]}(x{int(env.hands[0,0,i])})" for i in range(13) if env.hands[0,0,i] > 0]
+                my_fu = [f"{rank_names[i]}(x{int(env.face_up_piles[0,0,i])})" for i in range(13) if env.face_up_piles[0,0,i] > 0]
+                my_fd_count = int(env.face_down_piles[0, 0].sum())
+                
+                print(f" Hand:    {', '.join(my_hand) if my_hand else 'None'}")
+                print(f" Face-Up: {', '.join(my_fu) if my_fu else 'None'}")
+                print(f" Face-Down: [{'x ' * my_fd_count}]")
+                print("-" * 30)
 
-            # get AI inference for suggestions or opponent moves
+            # Inference
             masks = env.get_valid_mask()
             static_obs = create_static_input_vector(env)
-
             h, c = hidden_states[current_player]
-            probs, (h_new, c_new) = king_model(
-                action_history,
-                static_obs,
-                masks.unsqueeze(0),
-                hidden_state=(h, c)
-            ) 
+            probs, (h_new, c_new) = king_model(action_history, static_obs, masks.unsqueeze(0), (h, c))
             hidden_states[current_player] = (h_new, c_new)
 
-            # Handle action selection
-            category_names = ["Hand", "Hand 2 x", "Hand 3 x", "Hand 4 x","Face-Up", "Face-Down"]
-            if current_player == 0: # user
+            if current_player == 0:
                 suggested_action = torch.argmax(probs, dim=-1).item()
                 valid_actions = torch.where(masks[0])[0].cpu().numpy().tolist()
 
-                print(f"AI suggests action: [{Fore.YELLOW}{suggested_action}{Style.RESET_ALL}] ")
-                print(f"Valid actions: ")
-                for action in valid_actions:
+                print(f"{Fore.WHITE}Suggested: {Fore.YELLOW}{suggested_action}{Style.RESET_ALL}")
+                print(f"Options:")
+                
+                # Group and print actions cleanly
+                for i, action in enumerate(valid_actions):
                     if action == 78:
-                        num_cards = env.discard_counts[0].sum().item()
-                        print(f" - [{Fore.YELLOW}{action}{Style.RESET_ALL}]: Pick up {num_cards}-card pile")
+                        desc = f"{Fore.RED}PICK UP PILE{Style.RESET_ALL}"
                     else:
-                        category, rank = action // 13, action % 13
-                        print(f" - [{Fore.YELLOW}{action}{Style.RESET_ALL}]: Play from {category_names[category]} {rank_names[rank]} ")
-
-                choice = -1 
+                        cat, rank = action // 13, action % 13
+                        desc = f"{category_names[cat]} {rank_names[rank]}"
+                    
+                    print(f"  [{Fore.YELLOW}{action:2}{Style.RESET_ALL}] {desc}", end="\t")
+                    if (i + 1) % 3 == 0: print() # New line every 3 actions
+                
+                choice = -1
                 while choice not in valid_actions:
-                    choice = int(input(f"Enter your action choice: "))
-                    if choice not in valid_actions:
-                        print(f"{Fore.RED}Invalid action. Please choose again.{Style.RESET_ALL}")
+                    try:
+                        choice = int(input(f"\n\nChoose Action: "))
+                    except ValueError: pass
                 action = choice
-            else: # AI players
+            else:
+                # AI turn summary
                 action = torch.argmax(probs[0]).item()
                 color = Fore.BLUE if current_player == 1 else Fore.MAGENTA
                 if action == 78:
-                    num_cards = env.discard_counts[0].sum().item()
-                    print(f"{color}Player {current_player} picked up the {num_cards}-card pile. [{action}]{Style.RESET_ALL}")
+                    print(f"{color}Player {current_player} picks up the pile.{Style.RESET_ALL}")
                 else:
-                    category, rank = action // 13, action % 13
-                    print(f"{color}Player {current_player} plays action: Play from {category_names[category]} {rank_names[rank]} ([{action}]){Style.RESET_ALL}")
+                    cat, rank = action // 13, action % 13
+                    print(f"{color}Player {current_player} plays {category_names[cat]} {rank_names[rank]}.{Style.RESET_ALL}")
 
-            # Step the environment
+            # Step and Update History
             action_tensor = torch.tensor([action], device=device)
             rewards, done = env.step(action_tensor)
-            total_rewards += rewards
-            print(f"Player {current_player}'s hand: {env.hands[0, current_player].cpu().numpy()}")
-
-            for player in range(3):
-                if rewards[0, player].item() <= 0: 
-                    color = Fore.RED
-                else:
-                    color = Fore.GREEN
-                print(f"Player {player} rewards for this turn : {color}{rewards[0, player].cpu().numpy():.2f}{Style.RESET_ALL} ({total_rewards[0, player].cpu().numpy():.2f})")
-
-            # update the action history
+            
             new_action_onehot = torch.zeros((batch_size, 1, 79), device=device)
             new_action_onehot[0, 0, action] = 1.0
             action_history = torch.cat((action_history[:, 1:, :], new_action_onehot), dim=1)
 
-    # Print final results
     results = env.players_out[0].cpu().numpy().tolist()
     rankings = [("You" if p == 0 else f"Opponent {p}") for p in results if p != -1]
-    print(f"\n{Fore.GREEN}Game Over! Final Rankings: {rankings}{Style.RESET_ALL}")
+    print(f"\n{Fore.GOLD}{Style.BRIGHT}🏆 FINAL RANKINGS: {' > '.join(rankings)}{Style.RESET_ALL}")
 
 if __name__ == "__main__":
-    play_kings_against_kings('Palace_king.pth')
+    # play_kings_against_kings('Palace_king.pth')
+    play_against_kings('Palace_king.pth')
 
 
 

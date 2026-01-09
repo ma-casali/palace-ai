@@ -42,7 +42,7 @@ class LivePlot:
         
         # We'll calculate smoothed values on the fly to avoid list/array mismatches
         self.fig, self.ax = plt.subplots(3, 1, figsize=(10, 6))
-        plt.ion() # Turn on interactive mode
+        # plt.ion() # Turn on interactive mode
 
     def update(self, generation, reward, total_loss, lr, entropy, stalemate_rate):
         # Append new data to lists
@@ -70,8 +70,6 @@ class LivePlot:
             mean_rew = np.mean(rew_arr, axis=1)
         else:
             mean_rew = rew_arr
-            
-        self.ax[0].plot(gen_arr, mean_rew, color='red', alpha=0.3, label='Raw Batch Mean')
         
         # Smoothed line (Window of 10)
         if len(mean_rew) > self.smooth_win:
@@ -103,6 +101,8 @@ class LivePlot:
         plt.tight_layout()
         plt.draw()
         plt.pause(0.01)
+
+        return np.abs(np.mean(np.diff(smoothed_l[-self.smooth_win:])) if len(loss_arr) > self.smooth_win else np.abs(np.mean(np.diff(loss_arr))))
 # endregion
 
 # region Functions
@@ -428,6 +428,8 @@ level_wins = torch.zeros(4, device = device)
 level_counts = torch.zeros(4, device = device)
 current_level_probs = [0.0, 0.0, 0.0, 1.0] # start all at level 3
 
+delta_smoothed_loss = None
+
 # profiler = cProfile.Profile()
 # profiler.enable()
 
@@ -458,7 +460,7 @@ try:
             current_ent_coef = max(final_entropy_coef, current_ent_coef * ent_decay)
             current_lr = max(final_lr, current_lr * lr_decay)
 
-        if generation % 500 == 0 and generation > 0:
+        if (generation % 500 == 0 and generation > 0) or (delta_smoothed_loss is not None and delta_smoothed_loss < 1e-4):
             for param_group in optimizer.param_groups:
                 param_group['lr'] = initial_lr
 
@@ -471,7 +473,7 @@ try:
         print(f"Generation {generation} completed.")
         print(f"Loss = {total_loss:.4f}, \nLR={current_lr:.6f}, \nEntropy Coef={current_ent_coef:.4f}, \nStalemate Rate={stalemate_rate:.4f}")
         print(f"Mean Turns Taken: {player_counters.sum(dim=0).float().mean().item():.2f}")
-        print(f"Level Distribution Probabilities: {current_level_probs:.2f}")
+        print(f"Level Distribution Probabilities: {[f'{prob:.2f}' for prob in current_level_probs]}")
         print("="*50 + "\n")
         
         # b_rew shape: (NumPlayers, BatchSize, MaxTurns)
@@ -485,7 +487,7 @@ try:
         # Ensure total_loss is a scalar for the plotter
         loss_val = total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss
 
-        plotter.update(
+        delta_smoothed_loss = plotter.update(
             generation, 
             avg_rewards, 
             loss_val, 

@@ -282,9 +282,12 @@ def play_against_kings(king_path):
                 for i, action in enumerate(valid_actions):
                     if action == 78:
                         desc = f"{Fore.RED}PICK UP PILE{Style.RESET_ALL}"
-                    else:
+                    elif action <= 5 * 13:
                         cat, rank = action // 13, action % 13
                         desc = f"{category_names[cat]} {rank_names[rank]}"
+                    else: 
+                        cat, rank = action // 13, action % 13
+                        desc = f"{category_names[cat]}"
                     
                     print(f"  [{Fore.YELLOW}{action:2}{Style.RESET_ALL}] {desc}", end="\t")
                     if (i + 1) % 3 == 0: print() # New line every 3 actions

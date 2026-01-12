@@ -123,6 +123,10 @@ class PalaceEnv:
             flat_idx = flat_idx.reshape(-1)
             source_ones = torch.ones(flat_idx.shape[0], device=self.device, dtype=torch.float32)
             self.drawpile_counts.view(-1).index_add_(0, flat_idx, source_ones)
+
+            # make sure the player with the lowest card after the dealer goes first
+            min_cards, _ = l0_cards.min(dim=1)
+            self.active_players[l0_mask] = (min_cards % self.num_players).long()
             
         if hi_mask.any():
             num_hi = hi_mask.sum().item()
@@ -140,6 +144,9 @@ class PalaceEnv:
             flat_idx = valid_batches.long() * 13 + valid_ranks.long()
             source_ones = torch.ones(valid_ranks.shape[0], device=self.device, dtype=torch.float32)
             self.drawpile_counts.view(-1).index_add_(0, flat_idx, source_ones)
+
+            # pick a random player to go first
+            self.active_players[hi_mask] = torch.randint(0, self.num_players, self.active_players[hi_mask].shape, device=self.device)
 
         self.hands[l2_mask] = 0
         self.face_up_piles[l3_mask] = 0

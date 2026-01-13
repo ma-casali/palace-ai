@@ -47,29 +47,30 @@ class PalaceEnv:
         self.max_turns = 300
 
         # each state within the environment isof shape (batch, players, ranks)
-        self.hands = torch.zeros((batch_size, num_players, 13), dtype=torch.long, device=device)
+        self.hands = torch.zeros((batch_size, num_players, 13), dtype=torch.float32, device=device)
         self.face_up_piles = torch.zeros((batch_size, num_players, 13), dtype=torch.long, device=device)
         self.face_down_piles = torch.zeros((batch_size, num_players, 13), dtype=torch.long, device=device)
 
         # other piles (1, batch_size)
-        self.discard_counts = torch.zeros((batch_size, 13), dtype=torch.long, device=device)
+        self.discard_counts = torch.zeros((batch_size, 13), dtype=torch.float32, device=device)
         self.top_cards = -torch.ones(batch_size, dtype=torch.long, device=device) # -1 means empty discard pile
-        self.drawpile_counts = torch.zeros((batch_size, 13), dtype=torch.float32, device=device)
+        self.drawpile_decks = torch.arange(13, device=self.device).repeat(self.batch_size, 4)
+        self.drawpile_ptrs = torch.zeros((batch_size,), dtype=torch.long, device=device)
         self.run_ranks = -1*torch.ones((batch_size,), dtype=torch.long, device=device)
         self.run_count = torch.zeros((batch_size,), dtype=torch.long, device=device)
 
         # meta-states
         self.active_players = torch.zeros(batch_size, dtype = torch.long, device = device)
-        self.players_out = -1*torch.ones((batch_size, num_players), dtype = torch.long, device = device) # -1 means still in game
+        self.finish_times = torch.zeros((batch_size, num_players), dtype = torch.long, device = device) # 0 means still in game
         self.done = torch.zeros(batch_size, dtype = torch.bool, device = device)
         self.stalemates = torch.zeros(batch_size, dtype = torch.bool, device = device)
 
     def reset(self, players, levels = [1.0, 0.0, 0.0, 0.0]):
         """
         level 0: standard game (start from beginning)
-        level 1: noisy draw pile, 3 cards in hand
-        level 2: noisy draw pile, 0 cards in hand, face-up piles only
-        level 3: noisy draw pile, 0 cards in hand, face-down piles only
+        level 1: noisy hands, no drawpile
+        level 2: 0 cards in hand, face-up piles only
+        level 3: 0 cards in hand, face-down piles only
         """
         self.turn_counts.fill_(0)
         self.hands.fill_(0)
@@ -77,11 +78,10 @@ class PalaceEnv:
         self.face_down_piles.fill_(0)
         self.discard_counts.fill_(0)
         self.top_cards.fill_(-1)
-        self.drawpile_counts.fill_(0)
         self.run_ranks.fill_(-1)
         self.run_count.fill_(0)
         self.active_players.fill_(0)
-        self.players_out.fill_(-1)
+        self.finish_times.fill_(0)
         self.done.fill_(False)
         self.stalemates.fill_(False)
         self.players = players
@@ -89,69 +89,94 @@ class PalaceEnv:
         level_distribution = torch.tensor(levels, device=self.device)
         levels = torch.multinomial(level_distribution, self.batch_size, replacement=True)
 
-        base_deck = torch.arange(13, device=self.device).repeat(4)
-        all_decks = base_deck.unsqueeze(0).repeat(self.batch_size, 1)
+        self.drawpile_decks = torch.arange(13, device=self.device).repeat(self.batch_size, 4)
         for i in range(self.batch_size):
-            all_decks[i] = all_decks[i, torch.randperm(52)]
+            self.drawpile_decks[i] = self.drawpile_decks[i, torch.randperm(52)]
         
         for p in range(self.num_players):
             start_idx = p * 9
-            facedown_ranks = all_decks[:, start_idx:start_idx + 3]
-            faceup_ranks = all_decks[:, start_idx + 3:start_idx + 6]
-            hand_ranks = all_decks[:, start_idx + 6:start_idx + 9]
+            facedown_ranks = self.drawpile_decks[:, start_idx:start_idx + 3]
+            faceup_ranks = self.drawpile_decks[:, start_idx + 3:start_idx + 6]
+            hand_ranks = self.drawpile_decks[:, start_idx + 6:start_idx + 9]
 
             self.face_down_piles[:, p].scatter_add_(1, facedown_ranks, torch.ones_like(facedown_ranks, dtype=torch.long))
             self.face_up_piles[:, p].scatter_add_(1, faceup_ranks, torch.ones_like(faceup_ranks, dtype=torch.long))
-            self.hands[:, p].scatter_add_(1, hand_ranks, torch.ones_like(hand_ranks, dtype=torch.long))
-
-        remaining_deck = all_decks[:, self.num_players * 9:]
-        num_remaining = remaining_deck.shape[1]
+            self.hands[:, p].scatter_add_(1, hand_ranks, torch.ones_like(hand_ranks, dtype=self.hands.dtype))
 
         # store the remaining cards in the draw pile
         l0_mask = (levels == 0)
+        l1_mask = (levels == 1)
         hi_mask = (levels >= 1)
         l2_mask = (levels >= 2)
         l3_mask = (levels >= 3)
 
         if l0_mask.any():
-            l0_batch_indices = torch.where(l0_mask)[0]
-            num_l0 = l0_batch_indices.shape[0]
-            l0_cards = remaining_deck[l0_mask]
-            num_cards_in_draw = l0_cards.shape[1]
-            batch_coords = l0_batch_indices.unsqueeze(1).expand(-1, num_cards_in_draw).contiguous().view(-1)
-            flat_idx = (batch_coords.long() * 13 + l0_cards.view(-1).long())
-            flat_idx = flat_idx.reshape(-1)
-            source_ones = torch.ones(flat_idx.shape[0], device=self.device, dtype=torch.float32)
-            self.drawpile_counts.view(-1).index_add_(0, flat_idx, source_ones)
-
+            self.drawpile_ptrs[l0_mask] = 27  # 52 - 27 = 25 cards remaining in draw pile
             # make sure the player with the lowest card after the dealer goes first
-            min_cards, _ = l0_cards.min(dim=1)
-            self.active_players[l0_mask] = (min_cards % self.num_players).long()
+            self.get_starting_player(l0_mask)
             
-        if hi_mask.any():
-            num_hi = hi_mask.sum().item()
-            draw_count = torch.randint(0, 10, (num_hi,), device=self.device) # how many cards to put in draw pile
+        # pick a random player to go first
+        self.active_players[hi_mask] = torch.randint(0, self.num_players, self.active_players[hi_mask].shape, device=self.device)
 
-            range_tensor = torch.arange(num_remaining, device=self.device).expand(num_hi, num_remaining)
-            keep_mask = range_tensor < draw_count.unsqueeze(1)
+        if l1_mask.any():
+            self.hands[l1_mask] = 0
+            l1_batch_indices_raw = torch.where(l1_mask)[0]
+            num_l1 = l1_batch_indices_raw.shape[0]
+            num_players = self.num_players
 
-            hi_decks = remaining_deck[hi_mask]
-            valid_ranks = hi_decks[keep_mask]
+            draw_counts = torch.randint(0, 5, (num_l1, num_players), device=self.device)
+            total_to_draw = draw_counts.sum(dim=1)
+            max_draw = total_to_draw.max().item()
+            
+            offsets = torch.arange(max_draw, device=self.device).unsqueeze(0)
+            fetch_indices = self.drawpile_ptrs[l1_mask].unsqueeze(1) + offsets
+            fetch_indices = torch.clamp(fetch_indices, max=51)
 
-            batch_ids = torch.where(hi_mask)[0]
-            valid_batches = batch_ids.unsqueeze(1).expand(-1, num_remaining)[keep_mask]
+            drawn_ranks = torch.gather(self.drawpile_decks[l1_mask], 1, fetch_indices)
+            
+            boundaries = torch.cumsum(draw_counts, dim=1)
+            lower_bounds = torch.cat([torch.zeros((num_l1, 1), device=self.device), boundaries[:, :-1]], dim=1)
+            upper_bounds = boundaries
+            
+            card_indices = torch.arange(max_draw, device=self.device).view(1, 1, -1).expand(num_l1, num_players, -1)
+            
+            assign_mask = (card_indices >= lower_bounds.unsqueeze(2)) & (card_indices < upper_bounds.unsqueeze(2))
 
-            flat_idx = valid_batches.long() * 13 + valid_ranks.long()
-            source_ones = torch.ones(valid_ranks.shape[0], device=self.device, dtype=torch.float32)
-            self.drawpile_counts.view(-1).index_add_(0, flat_idx, source_ones)
+            final_batch_indices = l1_batch_indices_raw.view(-1, 1, 1).expand(-1, num_players, max_draw)[assign_mask]
+            final_player_indices = torch.arange(num_players, device=self.device).view(1, -1, 1).expand(num_l1, -1, max_draw)[assign_mask]
+            final_ranks = drawn_ranks.unsqueeze(1).expand(-1, num_players, -1)[assign_mask]
 
-            # pick a random player to go first
-            self.active_players[hi_mask] = torch.randint(0, self.num_players, self.active_players[hi_mask].shape, device=self.device)
+            if final_ranks.numel() > 0:
+                self.hands.index_put_(
+                    (final_batch_indices, final_player_indices, final_ranks.long()), 
+                    torch.ones(final_ranks.shape[0], device=self.device), 
+                    accumulate=True
+                )
+                self.drawpile_ptrs[l1_mask] += total_to_draw
 
+        # add top discard to the discard pile to start for hi levels
+        batch_indices = torch.where(hi_mask)[0]
+        first_card_ranks = self.drawpile_decks[hi_mask, self.drawpile_ptrs[hi_mask]]
+        self.drawpile_ptrs[hi_mask] += 1
+        flat_idx = (batch_indices.long() * 13) + first_card_ranks
+        source_ones = torch.ones(flat_idx.shape[0], device=self.device, dtype=self.discard_counts.dtype)
+        self.discard_counts.view(-1).index_add_(0, flat_idx, source_ones)
+        self.top_cards[hi_mask] = first_card_ranks
+
+        self.drawpile_ptrs[hi_mask] = 52  # no draw pile for hi levels
         self.hands[l2_mask] = 0
         self.face_up_piles[l3_mask] = 0
     
         return levels
+    
+    def get_starting_player(self, mask):
+        priority_order = [2, 3, 4, 6, 7, 9, 10, 11, 12, 0, 5, 1, 8]
+        mask_indices = torch.where(mask)[0]
+        for rank in priority_order:
+            has_rank = self.hands[mask][:, :, rank].nonzero(as_tuple=True) # (batch_indices, player_indices)
+            if has_rank[0].numel() > 0:
+                self.active_players[mask_indices[has_rank[0]]] = has_rank[1].min()
+                break
 
     def step(self, actions):
         
@@ -258,55 +283,81 @@ class PalaceEnv:
         # region DRAW CARDS IF NEEDED (UP TO 3)
         current_hand_totals = self.hands[torch.arange(self.batch_size), self.active_players].sum(dim = 1)
         missing_counts = torch.clamp(3 - current_hand_totals, min = 0)
-        can_draw = (missing_counts > 0) & (self.drawpile_counts[batch_ids].sum(dim = 1) > 0)
+        deck_totals = 52 - self.drawpile_ptrs
+        can_draw = (missing_counts > 0) & (deck_totals > 0) & ~self.done
         if can_draw.any():
-            for _ in range(3):
-                deck_full = (self.drawpile_counts[batch_ids].sum(dim = 1) > 0)
-                draw_mask = (self.hands[torch.arange(self.batch_size), self.active_players].sum(dim = 1) < 3) & deck_full
-                if not draw_mask.any(): break
-                drawn_ranks = torch.multinomial(self.drawpile_counts[draw_mask].float(), 1).squeeze(1)
-                self.hands[batch_ids[draw_mask], self.active_players[draw_mask], drawn_ranks] += 1
-                self.drawpile_counts[draw_mask, drawn_ranks] -= 1
+            draw_batch_ids = batch_ids[can_draw]
+            player_indices = self.active_players[can_draw]
+            
+            actual_draw_counts = torch.minimum(missing_counts[can_draw], deck_totals[can_draw])
 
-                rewards[draw_mask, self.active_players[draw_mask]] += cfg['hand_size_penalty']
+            offsets = torch.zeros(3, device=self.device, dtype=torch.long)
+            fetch_idx = self.drawpile_ptrs[draw_batch_ids].unsqueeze(1) + offsets  # (num_draws, 3)
+            fetch_idx = torch.clamp(fetch_idx, max=51)
+
+            drawn_ranks = torch.gather(self.drawpile_decks[draw_batch_ids], 1, fetch_idx)
+
+            # mask out what we don't need
+            draw_idx_grid = torch.arange(3, device=self.device).expand(actual_draw_counts.shape[0], -1)
+            valid_mask = draw_idx_grid < actual_draw_counts.unsqueeze(1)
+
+            # flatten for indexing
+            flat_batches = draw_batch_ids.unsqueeze(1).expand(-1, 3)[valid_mask]
+            flat_players = player_indices.unsqueeze(1).expand(-1, 3)[valid_mask]
+            flat_ranks = drawn_ranks[valid_mask]
+
+            if flat_ranks.numel() > 0:
+                # update hands and drawpile counts
+                self.hands[flat_batches, flat_players, flat_ranks] += 1
+                self.drawpile_ptrs[draw_batch_ids] += actual_draw_counts.long()
+                
+            # update rewards
+            cards_per_player = actual_draw_counts
+            relevant_player_ids = self.active_players[can_draw]
+            relevant_batch_ids = batch_ids[can_draw]
+            rewards[relevant_batch_ids, relevant_player_ids] += cards_per_player * cfg['hand_size_penalty']
 
         # Calculate who has NO cards left in any pile
         # Shape: (Batch, Players)
-        has_no_cards = (self.hands.sum(dim=2) == 0) & \
-                    (self.face_up_piles.sum(dim=2) == 0) & \
-                    (self.face_down_piles.sum(dim=2) == 0)
+        has_no_cards = (self.hands.sum(dim=2) == 0) & (self.face_up_piles.sum(dim=2) == 0) & (self.face_down_piles.sum(dim=2) == 0)
+        # determine if they were already recorded as out
+        is_out_already = (self.finish_times != 0).any(dim = 1, keepdim=True)
+        is_already_recorded = (self.finish_times != 0)
 
-        # Update players_out for anyone who is finished but not yet recorded
-        for p in range(self.num_players):
-            # Players who are finished but not in players_out
-            already_recorded = (self.players_out == p).any(dim=1)
-            just_finished = has_no_cards[:, p] & ~already_recorded
-            
-            if just_finished.any():
-                jf_indices = torch.where(just_finished)[0]
-                for idx in jf_indices:
-                    # Find first empty slot (-1)
-                    slots = (self.players_out[idx] == -1).nonzero(as_tuple=True)[0]
-                    if slots.numel() > 0:
-                        self.players_out[idx, slots[0]] = p
-                        # Optional: Give reward to that specific player
-                        rewards[idx, p] += cfg['win_reward'] + cfg['card_difference_bonus_rate'] * (self.num_players * 9 - (self.hands[idx].sum() + self.face_up_piles[idx].sum() + self.face_down_piles[idx].sum()))
-        # endregion
+        # check if anyone just finished
+        just_finished_mask = has_no_cards & ~is_already_recorded
+        if just_finished_mask.any():
+            # determine if they are the first out
+            winner_mask = ~is_out_already & just_finished_mask.any(dim = 1)
+            winner_batch_ids = torch.where(winner_mask)[0]
+            total_cards_in_game = self.hands[winner_batch_ids].sum(dim=(1,2)) + \
+                                    self.face_up_piles[winner_batch_ids].sum(dim=(1,2)) + \
+                                    self.face_down_piles[winner_batch_ids].sum(dim=(1,2))
+            # give rewards to the winners
+            bonus = cfg['card_difference_bonus_rate'] * (self.num_players * 9 - total_cards_in_game)
+            rewards[winner_batch_ids, self.active_players[winner_batch_ids]] += cfg['win_reward'] + bonus
+
+            self.finish_times[just_finished_mask] = self.turn_counts[just_finished_mask.any(dim = 1)]
 
         # region GLOBAL DONE CHECK
         # A game is done if (num_players - 1) players have finished
-        players_finished_count = (self.players_out != -1).sum(dim=1)
+        players_finished_count = (self.finish_times != 0).sum(dim=1)
         newly_done = (players_finished_count >= self.num_players - 1) & ~self.done
 
         if newly_done.any():
-            done_batches = torch.where(newly_done)[0]
-            self.done[done_batches] = True
-            
-            for i in done_batches:
-                # Find the one player NOT in self.players_out[i]
-                out_list = self.players_out[i].tolist()
-                loser_id = next(p for p in range(self.num_players) if p not in out_list)
-                rewards[i, loser_id] += cfg['lose_penalty'] + cfg['card_difference_penalty_rate'] * (self.hands[i].sum() + self.face_up_piles[i].sum() + self.face_down_piles[i].sum())
+            self.done[newly_done] = True
+
+            # find losers in each newly done batch
+            is_loser = (self.finish_times == 0) & newly_done.unsqueeze(1)
+            self.finish_times[is_loser] = self.turn_counts[is_loser.any(dim = 1)]
+
+            # assign penalties to the losers
+            negative_bonus = cfg['card_difference_penalty_rate'] * (
+                self.hands[newly_done].sum(dim=(1,2)) +
+                self.face_up_piles[newly_done].sum(dim=(1,2)) +
+                self.face_down_piles[newly_done].sum(dim=(1,2))
+            )
+            rewards[is_loser] += cfg['lose_penalty'] + negative_bonus
         # endregion
 
         # region UPDATE DISCARD PILE COUNTS AND TOP CARDS
@@ -315,19 +366,20 @@ class PalaceEnv:
         self.discard_counts.scatter_add_(
             1,
             card_ranks.unsqueeze(1),
-            (num_cards_played * not_pickup).unsqueeze(1)
+            (num_cards_played * not_pickup).unsqueeze(1).to(self.discard_counts.dtype)
         )
         self.top_cards = torch.where(not_pickup, card_ranks, torch.tensor(-1, device=self.device))
         # endregion
 
         # region ROTATE TO NEXT PLAYER
         is_burn = (card_ranks == 8) | (self.run_count >= 4)
-        
         self.active_players = torch.where(is_burn, self.active_players, (self.active_players + 1) % self.num_players)
 
+        # this for loop ensures that we skip over players who are already done,
+        # computationally efficient over vectorization for this case
         for _ in range(self.num_players - 1):
             still_active_mask = ~self.done
-            is_out_mask = (self.players_out == self.active_players.unsqueeze(1)).any(dim = 1)
+            is_out_mask = (torch.gather(self.finish_times, 1, self.active_players.unsqueeze(1)).squeeze(1) != 0)
             to_shift = is_out_mask & still_active_mask
             if not to_shift.any(): 
                 break

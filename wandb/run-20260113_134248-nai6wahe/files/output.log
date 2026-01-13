@@ -1,0 +1,9 @@
+[34m[1mwandb[0m: Ctrl + C detected. Stopping sweep.
+Traceback (most recent call last):
+  File "/Users/matthewcasali/Documents/PythonScripts/palace-ai/VectorizedTraining.py", line 470, in sweep_train
+    b_lp, b_rew, b_ent, player_counters, stalemate_rate, level_wins, level_counts = training_step(players, best_player_weights, batch_size, sequence_length, level_wins, level_counts, current_level_probs)
+  File "/Users/matthewcasali/Documents/PythonScripts/palace-ai/VectorizedTraining.py", line 282, in training_step
+    rewards, dones = env.step(action_indices)
+  File "/Users/matthewcasali/Documents/PythonScripts/palace-ai/VectorizedCardGame.py", line 211, in step
+    rewards[actions < 78, self.active_players[actions < 78]] += cfg['card_played_base'] + cfg['per_card_bonus'] * (torch.where(action_categories[actions < 78] + 1 <= 4, action_categories[actions < 78] + 1, 1))
+Exception

@@ -39,7 +39,7 @@ def create_static_input_vector(env):
     table_discard = env.discard_counts.float()                                     # (batch_size, 13)
     table_top = env.top_cards.view(-1, 1).float()                                  # (batch_size, 1)
     table_run = env.run_count.view(-1, 1).float()                                  # (batch_size, 1)
-    table_draw = env.drawpile_counts.sum(dim=1, keepdim=True).float()              # (batch_size, 1)
+    table_draw = 52 - env.drawpile_ptrs.view(-1, 1).float()                        # (batch_size, 1)
 
     static_obs = torch.cat([
         self_hand, self_faceup, self_facedown,         # 27
@@ -240,7 +240,7 @@ def play_against_kings(king_path):
                 top_card_idx = env.top_cards[0].item()
                 top_card_name = rank_names[top_card_idx % 13] if top_card_idx >= 0 else "Empty"
                 pile_count = int(env.discard_counts[0].sum().item())
-                draw_count = int(env.drawpile_counts[0].sum().item())
+                draw_count = int(52 - env.drawpile_ptrs[0].item())
                 
                 print(f"Draw Pile: [{Fore.YELLOW}{draw_count}{Style.RESET_ALL}] cards left")
                 print(f"Current Pile: {Fore.CYAN}{top_card_name}{Style.RESET_ALL} (x{env.run_count[0].item()}) | Pile size: {pile_count}")
@@ -316,9 +316,9 @@ def play_against_kings(king_path):
             new_action_onehot[0, 0, action] = 1.0
             action_history = torch.cat((action_history[:, 1:, :], new_action_onehot), dim=1)
 
-    results = env.players_out[0].cpu().numpy().tolist()
+    results = np.argsort(env.finish_times.cpu().numpy())
     rankings = [("You" if p == 0 else f"Opponent {p}") for p in results if p != -1]
-    print(f"\n{Fore.GOLD}{Style.BRIGHT}🏆 FINAL RANKINGS: {' > '.join(rankings)}{Style.RESET_ALL}")
+    print(f"\n{Fore.YELLOW}{Style.BRIGHT}🏆 FINAL RANKINGS: {' > '.join(rankings)}{Style.RESET_ALL}")
 
 if __name__ == "__main__":
     # play_kings_against_kings('Palace_king.pth')

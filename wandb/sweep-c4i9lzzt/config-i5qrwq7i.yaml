@@ -1,0 +1,10 @@
+wandb_version: 1
+
+final_ent:
+  value: 0.02
+final_lr:
+  value: 1.5839554530317109e-06
+initial_ent:
+  value: 0.2
+initial_lr:
+  value: 4.151953046618555e-05

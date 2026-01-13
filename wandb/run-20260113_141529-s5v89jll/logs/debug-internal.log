@@ -1,0 +1,6 @@
+{"time":"2026-01-13T14:15:29.071997-08:00","level":"INFO","msg":"stream: starting","core version":"0.23.1"}
+{"time":"2026-01-13T14:15:29.209113-08:00","level":"INFO","msg":"stream: created new stream","id":"s5v89jll"}
+{"time":"2026-01-13T14:15:29.209143-08:00","level":"INFO","msg":"handler: started","stream_id":"s5v89jll"}
+{"time":"2026-01-13T14:15:29.209299-08:00","level":"INFO","msg":"stream: started","id":"s5v89jll"}
+{"time":"2026-01-13T14:15:29.209313-08:00","level":"INFO","msg":"sender: started","stream_id":"s5v89jll"}
+{"time":"2026-01-13T14:15:29.209311-08:00","level":"INFO","msg":"writer: started","stream_id":"s5v89jll"}

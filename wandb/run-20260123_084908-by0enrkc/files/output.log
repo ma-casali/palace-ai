@@ -30,3 +30,10 @@ New King: Player 1 (Challenger outperformed king. 0.34 - 0.30 > 0.02)
 Model saved to temporary_king.pth
 Loss history: [353. 304. 367.]
 Loss history: [327. 346. 351.]
+Loss history: [318. 341. 365.]
+Loss history: [351. 337. 336.]
+Loss history: [316. 367. 341.]
+Loss history: [345. 334. 345.]
+New King: Player 2 (Challenger outperformed king. 0.34 - 0.31 > 0.02)
+Model saved to temporary_king.pth
+Loss history: [350. 354. 320.]

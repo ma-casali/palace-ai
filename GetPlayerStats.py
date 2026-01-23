@@ -426,15 +426,16 @@ def save_explanation_file(shap_values, input_record, action_idx_record, acting_p
     with open(filename, "w") as f:
         f.write(document_string)
 
-king_path = "Palace_king.pth"
-print("Playing game...")
-input_record, action_record, acting_player, action_idx_record = play_game(king_path, device = device)
+if __name__ == "__main__":
+    king_path = "Palace_king.pth"
+    print("Playing game...")
+    input_record, action_record, acting_player, action_idx_record = play_game(king_path, device = device)
 
-print("Analyzing game performance...")
-shap_results = analyze_game_dominance(king_path, input_record, action_record, acting_player)
+    print("Analyzing game performance...")
+    shap_results = analyze_game_dominance(king_path, input_record, action_record, acting_player)
 
-print("Saving explanation file...")
-save_explanation_file(shap_results, input_record, action_idx_record, acting_player, "game_explanation.txt")
+    print("Saving explanation file...")
+    save_explanation_file(shap_results, input_record, action_idx_record, acting_player, "game_explanation.txt")
 
-print("Plotting decision components...")
-plot_decision_component(shap_results, action_idx_record, action_record, acting_player)
+    print("Plotting decision components...")
+    plot_decision_component(shap_results, action_idx_record, action_record, acting_player)

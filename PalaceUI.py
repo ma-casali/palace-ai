@@ -1,5 +1,7 @@
 import pygame
 import torch
+import numpy as np
+import shap
 from VectorizedCardGame import PalaceEnv
 from PalacePlayer import PalacePlayer
 
@@ -439,6 +441,35 @@ class PalaceUI:
 
         return surf
     
+class PalaceExplainer:
+    def __init__(self, model, background_path, device):
+        self.model = model
+        self.device = device
+        background = np.load(background_path)
+        self.explainer = shap.Explainer(self.model_preict, background)
+
+    def model_predict(self, data):
+        # expand flattened data back to original shape
+        X = torch.tensor(data, dtype=torch.float32, device = self.device)
+        batch_size = X.shape[0]
+        
+        # first 6 * 79 = 474 are action history
+        action_dim = 79
+        seq_len = 6
+        action_history_flat = X[:, :seq_len * action_dim] # (B, 474)
+        static_obs = X[:, seq_len * action_dim:] # (B, 82)
+        action_history = action_history_flat.view(batch_size, seq_len, action_dim) # (B, 6, 79)
+
+        # initialize hidden states to zero
+        h0 = torch.zeros(self.model.num_rnn_layers, batch_size, self.model.hidden_dim, device=self.device)
+        c0 = torch.zeros(self.model.num_rnn_layers, batch_size, self.model.hidden_dim, device=self.device)
+
+        # the model will see all actions as valid for SHAP analysis
+        dummy_mask = torch.ones((batch_size, 79), device=self.device)
+        with torch.no_grad():
+            logits, _ = self.model(action_history, static_obs, dummy_mask, (h0, c0))
+            return logits.numpy()
+
 
 # region RUN_GAME
 def run_game(king_path):

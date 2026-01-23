@@ -247,7 +247,7 @@ class PalaceEnv:
             fail_batch_ids = facedown_batch_inds[is_fail]
             if fail_batch_ids.numel() > 0:
                 self.hands[fail_batch_ids, self.active_players[fail_batch_ids], chosen_ranks[is_fail]] += 1
-                rewards[fail_batch_ids] += cfg['pickup_base_penalty'] + cfg['pickup_per_card_penalty'] * self.discard_counts[fail_batch_ids].sum(dim=1) + cfg['played_facedown_failure_penalty']
+                rewards[fail_batch_ids] += cfg['pickup_base_penalty'] + cfg['pickup_per_card_penalty'] * self.discard_counts[fail_batch_ids].sum(dim=1)
 
             success_batch_ids = facedown_batch_inds[~is_fail]
             if success_batch_ids.numel() > 0:
@@ -291,7 +291,7 @@ class PalaceEnv:
             
             actual_draw_counts = torch.minimum(missing_counts[can_draw], deck_totals[can_draw])
 
-            offsets = torch.zeros(3, device=self.device, dtype=torch.long)
+            offsets = torch.arange(3, device=self.device, dtype=torch.long)
             fetch_idx = self.drawpile_ptrs[draw_batch_ids].unsqueeze(1) + offsets  # (num_draws, 3)
             fetch_idx = torch.clamp(fetch_idx, max=51)
 
@@ -349,7 +349,7 @@ class PalaceEnv:
 
             # find losers in each newly done batch
             is_loser = (self.finish_times == 0) & newly_done.unsqueeze(1)
-            self.finish_times[is_loser] = self.turn_counts[is_loser.any(dim = 1)]
+            self.finish_times[is_loser] = self.turn_counts[is_loser.any(dim = 1)] + 1
 
             # assign penalties to the losers
             negative_bonus = cfg['card_difference_penalty_rate'] * (

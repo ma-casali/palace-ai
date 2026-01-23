@@ -226,6 +226,7 @@ def play_against_kings(king_path):
 
     rank_names = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
     category_names = ["Single", "Pair", "Three", "Four", "Face-Up", "Face-Down"]
+    reward_list = [0.0 for _ in range(3)]
 
     print(f"\n{Fore.GREEN}{'='*50}\n   WELCOME TO PALACE: HUMAN VS KINGS\n{'='*50}{Style.RESET_ALL}")
 
@@ -275,7 +276,7 @@ def play_against_kings(king_path):
                 suggested_action = torch.argmax(probs, dim=-1).item()
                 valid_actions = torch.where(masks[0])[0].cpu().numpy().tolist()
 
-                print(f"{Fore.WHITE}Suggested: {Fore.YELLOW}{suggested_action}{Style.RESET_ALL}")
+                print(f"{Fore.WHITE}Suggested: {Fore.YELLOW}{suggested_action}{Style.RESET_ALL} with confidence: {probs[0, 0, suggested_action]:.2f}")
                 print(f"Options:")
                 
                 # Group and print actions cleanly
@@ -311,14 +312,20 @@ def play_against_kings(king_path):
             # Step and Update History
             action_tensor = torch.tensor([action], device=device)
             rewards, done = env.step(action_tensor)
+
+            reward_list[current_player] += rewards[0, current_player].item()
             
             new_action_onehot = torch.zeros((batch_size, 1, 79), device=device)
             new_action_onehot[0, 0, action] = 1.0
             action_history = torch.cat((action_history[:, 1:, :], new_action_onehot), dim=1)
 
     results = np.argsort(env.finish_times.cpu().numpy())
-    rankings = [("You" if p == 0 else f"Opponent {p}") for p in results if p != -1]
+    rankings = [("You" if p == 0 else f"Opponent {p}") for p in results[0] if p != -1]
     print(f"\n{Fore.YELLOW}{Style.BRIGHT}🏆 FINAL RANKINGS: {' > '.join(rankings)}{Style.RESET_ALL}")
+    reward_string = [f"You: {reward_color}{reward_list[0]:.2f}{Style.RESET_ALL}" if p == 0 else f"Opponent {p}: {reward_color}{reward_list[p]:.2f}{Style.RESET_ALL}"
+                     for p in range(3)
+                     for reward_color in [Fore.GREEN if reward_list[p] >= 0 else Fore.RED]]
+    print(f"{Fore.CYAN}Rewards - {' | '.join(reward_string)}{Style.RESET_ALL}\n")
 
 if __name__ == "__main__":
     # play_kings_against_kings('Palace_king.pth')

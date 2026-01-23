@@ -1,6 +1,0 @@
-{"time":"2026-01-13T14:15:35.064727-08:00","level":"INFO","msg":"stream: starting","core version":"0.23.1"}
-{"time":"2026-01-13T14:15:35.169882-08:00","level":"INFO","msg":"stream: created new stream","id":"aqitjai1"}
-{"time":"2026-01-13T14:15:35.169927-08:00","level":"INFO","msg":"handler: started","stream_id":"aqitjai1"}
-{"time":"2026-01-13T14:15:35.170092-08:00","level":"INFO","msg":"stream: started","id":"aqitjai1"}
-{"time":"2026-01-13T14:15:35.170112-08:00","level":"INFO","msg":"writer: started","stream_id":"aqitjai1"}
-{"time":"2026-01-13T14:15:35.170132-08:00","level":"INFO","msg":"sender: started","stream_id":"aqitjai1"}

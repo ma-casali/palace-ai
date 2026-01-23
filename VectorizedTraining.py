@@ -9,6 +9,8 @@ import pstats
 import time
 import os
 import multiprocessing
+import gc
+from Cocoa import NSAutoreleasePool
 
 from VectorizedCardGame import PalaceEnv
 from PalacePlayer import PalacePlayer
@@ -17,94 +19,46 @@ from PalacePlayer import PalacePlayer
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Using device: {device}")
 
-# region Classes
-class LivePlot:
-    def __init__(self):
-        # Initialize as empty lists for easier appending, convert to arrays for plotting
-        self.generation_history = []
-        self.reward_history = []
-        self.lr_history = []
-        self.total_loss_history = []
-        self.entropy_history = []
-        self.stalemate_history = []
-        self.game_length_history = []
-        self.smooth_win = 25
-        
-        # We'll calculate smoothed values on the fly to avoid list/array mismatches
-        self.fig, self.ax = plt.subplots(4, 1, figsize=(10, 8))
-        # plt.ion() # Turn on interactive mode
-
-    def update(self, generation, reward, total_loss, lr, entropy, stalemate_rate, game_length):
-        # Append new data to lists
-        self.generation_history.append(generation)
-        self.reward_history.append(reward)  # Assuming reward is a list/tensor of 3 players
-        self.total_loss_history.append(total_loss)
-        self.lr_history.append(lr)
-        self.entropy_history.append(entropy)
-        self.stalemate_history.append(stalemate_rate)
-        self.game_length_history.append(game_length)  # Placeholder if needed later
-
-        # Convert to numpy arrays for indexing/math
-        gen_arr = np.array(self.generation_history)
-        rew_arr = np.array(self.reward_history) # Shape: (Gen, 3)
-        loss_arr = np.array(self.total_loss_history)
-
-        # Clear axes
-        for a in self.ax: a.clear()
-
-        # --- 1. REWARD PLOT ---
-        # Plot individual player rewards (Red, transparent)
-        if rew_arr.ndim > 1:
-            for p in range(rew_arr.shape[1]):
-                self.ax[0].plot(gen_arr, rew_arr[:, p], color='red', alpha=0.15)
-            # Bold Line: Mean of all players
-            mean_rew = np.mean(rew_arr, axis=1)
-        else:
-            mean_rew = rew_arr
-        
-        # Smoothed line 
-        if len(mean_rew) > self.smooth_win:
-            smoothed = np.convolve(mean_rew, np.ones(self.smooth_win)/self.smooth_win, mode='valid')
-            self.ax[0].plot(gen_arr[self.smooth_win-1:], smoothed, color='red', linewidth=2, label='Smoothed')
-            
-        self.ax[0].set_title('Total Reward')
-
-        # --- 2. LOSS PLOT ---
-        self.ax[1].plot(gen_arr, loss_arr, color='blue', alpha=0.3)
-        if len(loss_arr) > self.smooth_win:
-            smoothed_l = np.convolve(loss_arr, np.ones(self.smooth_win)/self.smooth_win, mode='valid')
-            self.ax[1].plot(gen_arr[self.smooth_win-1:], smoothed_l, color='blue', linewidth=2)
-        self.ax[1].set_title('Total Loss')
-
-        # --- 3. METRICS ---
-        self.ax[2].plot(gen_arr, self.stalemate_history, label='Stalemate Rate (%)', color='purple')
-        self.ax[2].plot(gen_arr, self.game_length_history, label='Mean Game Length (turns)', color='brown')
-        self.ax[2].set_title('Training Metrics')
-        self.ax[2].legend(loc='best')
-
-        # --- 4. TRAINING PARAMETERS ---
-        self.ax[3].plot(gen_arr, self.lr_history, label='LR', color='green')
-        self.ax[3].plot(gen_arr, self.entropy_history, label='Entropy Coeff', color='orange')
-        
-        self.ax[3].set_yscale('log')
-        self.ax[3].set_title('Training Hyperparameters (Log Scale)')
-        self.ax[3].legend(loc='best')
-
-        # Formatting
-        for a in self.ax: a.grid(True, which='both', linestyle='--', alpha=0.5)
-        plt.tight_layout()
-        plt.draw()
-        plt.pause(0.01)
-
-        # Calculate delta of smoothed loss for convergence monitoring
-        delta_smoothed_loss = np.abs(np.mean(np.diff(smoothed_l[-self.smooth_win:])) if len(loss_arr) > self.smooth_win else np.abs(np.mean(np.diff(loss_arr))))
-        delta_smoothed_reward = np.abs(np.mean(np.diff(smoothed[-self.smooth_win:])) if len(mean_rew) > self.smooth_win else np.abs(np.mean(np.diff(mean_rew))))
-        
-        return delta_smoothed_loss, delta_smoothed_reward
-# endregion
-
 # region Functions
 
+def debug_memory_usage():
+    print("\n---Memory Usage Debug Info---")
+    tensors = 0
+    total_mem = 0
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
+                tensors += 1
+                total_mem += obj.element_size() * obj.nelement() / (1024 ** 2)  # in MB
+        except:
+            pass
+    print(f"Total tensors: {tensors}")
+    print(f"Total memory used by tensors: {total_mem:.2f} MB")
+
+    if torch.backends.mps.is_available():
+        allocated = torch.mps.current_allocated_memory() / (1024**2)
+        # This is what Activity Monitor sees:
+        driver = torch.mps.driver_allocated_memory() / (1024**2) 
+        print(f"PyTorch thinks it has: {allocated:.2f} MB")
+        print(f"macOS Driver actually has: {driver:.2f} MB")
+
+def init_weights(m):
+    if isinstance(m, torch.nn.Linear):
+        torch.nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+        if m.bias is not None:
+            torch.nn.init.constant_(m.bias, 0)
+    elif isinstance(m, torch.nn.LSTM):
+        for name, param in m.named_parameters():
+            if 'weight_ih' in name:
+                torch.nn.init.xavier_uniform_(param.data)
+            elif 'weight_hh' in name:
+                # cpu fallback for orthogonal init
+                cpu_data = param.data.to('cpu')
+                torch.nn.init.orthogonal_(cpu_data)
+                param.data.copy_(cpu_data.to(param.data.device))
+            elif 'bias' in name:
+                torch.nn.init.constant_(param.data, 0)
+    
 def save_best_player(model, filename = 'temporary_king.pth'):
     torch.save(model.state_dict(), filename)
     print(f"Model saved to {filename}")
@@ -271,8 +225,10 @@ def training_step(players, best_player_weights, batch_size, sequence_length, lev
                         (h_in, c_in)
                         )
                     combined_probs[turn_mask] = probs
-                    h_all[p_idx, :, turn_mask, :] = new_h
-                    c_all[p_idx, :, turn_mask, :] = new_c
+                    h_all[p_idx, :, turn_mask, :] = new_h.detach()
+                    c_all[p_idx, :, turn_mask, :] = new_c.detach()
+
+                    del new_h, new_c, h_in, c_in, probs
 
                 player_step_counters[p_idx, turn_mask] += 1
 
@@ -318,7 +274,19 @@ def training_step(players, best_player_weights, batch_size, sequence_length, lev
         level_counts[lvl] += lvl_mask.sum().item()
         level_wins[lvl] += (lvl_mask & (env.done & ~env.stalemates)).sum().item()
 
-    return buffer_lp, buffer_rew, buffer_ent, player_step_counters, stalemate_rate, level_wins, level_counts
+    finished_mask = ~env.stalemates
+    num_finished = finished_mask.sum().item()
+    king_wins_count = 0
+    learner_wins_count = 0
+    if num_finished > 0:
+        king_wins_count = (torch.argmin(env.finish_times[finished_mask, :], axis=1) == 0).sum().item()
+        learner_wins_count = (torch.argmin(env.finish_times[finished_mask, :], axis=1) != 0).sum().item()
+
+    # calculate win rates for logging
+    king_win_rate = king_wins_count / batch_size
+    learner_win_rate = (learner_wins_count / 2.0) / batch_size
+
+    return buffer_lp, buffer_rew, buffer_ent, player_step_counters, stalemate_rate, level_wins, level_counts, king_win_rate, learner_win_rate
 
 def update_level_distribution(wins, counts, current_probs):
     win_rates = wins / (counts + 1e-8)
@@ -371,9 +339,8 @@ def evaluate_players(players, num_games=100, sequence_length=6, max_turns=500):
     for p in players:
         p.eval()
 
-    turn_count = 0
     with torch.inference_mode():
-        while active_envs.any() and turn_count < max_turns:
+        while active_envs.any():
             masks = env.get_valid_mask()
             static_obs = create_static_input_vector(env)
             actions = torch.zeros(num_games, dtype=torch.long, device=device)
@@ -389,14 +356,16 @@ def evaluate_players(players, num_games=100, sequence_length=6, max_turns=500):
                         action_history[turn_mask], 
                         static_obs[turn_mask], 
                         masks[turn_mask],
-                        (h[:, turn_mask, :], c[:, turn_mask, :])
+                        (h[:, turn_mask, :].detach(), c[:, turn_mask, :].detach())
                     )
                     
                     actions[turn_mask] = torch.argmax(probs, dim=1)
                     
                     # Update hidden states for the next time this player acts
-                    hidden_states[p_idx][0][:, turn_mask, :] = new_h
-                    hidden_states[p_idx][1][:, turn_mask, :] = new_c
+                    hidden_states[p_idx][0][:, turn_mask, :] = new_h.detach()
+                    hidden_states[p_idx][1][:, turn_mask, :] = new_c.detach()
+
+                    del new_h, new_c, h, c, probs
 
             # Step the environment
             _, dones = env.step(actions)
@@ -412,17 +381,15 @@ def evaluate_players(players, num_games=100, sequence_length=6, max_turns=500):
             # track losses for each player
             just_finished = active_envs & dones
             if just_finished.any():
-                # The loser is the player who never finished (finish_time remains 0)
-                loser_mask = (env.finish_times == 0) & just_finished.unsqueeze(1)
-                losses += loser_mask.sum(dim=0).float()
+                batch_losers = torch.argmax(env.finish_times, dim = 1)
+                relevant_losers = batch_losers[just_finished] # only look at games that JUST finished
+
+                ones = torch.ones_like(relevant_losers, device=device, dtype=torch.float)
+                losses.scatter_add_(0, relevant_losers, ones)
 
             active_envs &= ~dones
-            turn_count += 1
-
-        # Handle Stalemates: If turns exceed max, whoever is still playing is a loser
-        if active_envs.any():
-            remaining_losers = (env.finish_times == 0) & active_envs.unsqueeze(1)
-            losses += remaining_losers.sum(dim=0).float()
+        
+        print(f"Total complete games: {num_games - active_envs.sum().item()} out of {num_games}")
 
     return losses.cpu().numpy()
 
@@ -435,13 +402,19 @@ def get_dynamic_entropy(generation, cycle_len = 250, start_ent = 0.05, end_ent =
     return max(ent_coef, end_ent)
 
 def sweep_train():
+
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    os.environ["WANDB_SILENT"] = "true"  # Suppress WANDB output except for errors
     run = wandb.init()
     
     try:
         config = wandb.config
 
+        # king file name
+        king_filename = f'sweep_kings/temporary_king_{run.id}.pth'
+
         # training length
-        num_generations = 500
+        num_generations = 1000
         batch_size = 256
 
         # learning rate
@@ -455,7 +428,7 @@ def sweep_train():
 
         # optimizer
         optimizer = torch.optim.Adam(shared_player.parameters(), lr=initial_lr)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=150, T_mult=2, eta_min=final_lr)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=config.annealing_generations, T_mult=2, eta_min=final_lr)
 
         # level tracking
         level_wins = torch.zeros(4, device = device)
@@ -471,15 +444,258 @@ def sweep_train():
             
         for generation in range(num_generations):
 
-            # Take a training step
-            b_lp, b_rew, b_ent, player_counters, stalemate_rate, level_wins, level_counts = training_step(players, best_player_weights, batch_size, sequence_length, level_wins, level_counts, current_level_probs)
-            mean_turns = player_counters.sum(dim=0).float().mean().item()
+            # start timing
+            start_time = time.perf_counter()
+
+            # create a pool for this generation
+            pool = NSAutoreleasePool.alloc().init()
+            try:
+                # Take a training step
+                b_lp, b_rew, b_ent, player_counters, stalemate_rate, \
+                    level_wins, level_counts, king_win_rate, learner_win_rate = training_step(
+                        players, best_player_weights, batch_size, sequence_length, level_wins, level_counts, current_level_probs)
+                
+                mean_turns = player_counters.sum(dim=0).float().mean().item()
+                patience_criterion = (stalemate_rate + mean_turns / 300.0) / 2.0
+                
+                # Update level distribution based on performance
+                current_level_probs = update_level_distribution(level_wins.cpu().numpy(), level_counts.cpu().numpy(), current_level_probs)
+
+                # adapt entropy coefficient according to learning rate schedule
+                current_ent_coef = get_dynamic_entropy(generation, start_ent=config.initial_ent, end_ent=config.final_ent)
+
+                # Update using the accumulated batch data
+                total_loss = finish_batch_update(
+                    optimizer, 
+                    players,
+                    b_lp, b_ent, b_rew, player_counters,
+                    ent_coef=current_ent_coef, 
+                    king_available=(best_player_weights is not None)
+                )           
+
+                del b_lp, b_ent, b_rew, player_counters
+
+                # end timing
+                step_duration = time.perf_counter() - start_time
+
+                # 2. Log to Weights & Biases
+                wandb.log({
+                    "generation": generation,
+                    "performance/step_duration": step_duration,
+                    
+                    # Training Dynamics
+                    "train/loss": total_loss.detach().item() if isinstance(total_loss, torch.Tensor) else total_loss,
+                    "train/learning_rate": scheduler.get_last_lr()[0].detach().cpu().item() if isinstance(scheduler.get_last_lr()[0], torch.Tensor) else scheduler.get_last_lr()[0],
+                    "train/entropy_coefficient": current_ent_coef,
+                    
+                    # Game Performance
+                    "game/stalemate_rate": stalemate_rate.detach().cpu().item() if isinstance(stalemate_rate, torch.Tensor) else stalemate_rate,
+                    "game/mean_turns_taken": mean_turns,
+                    "game/king_win_rate": king_win_rate.detach().cpu().item() if isinstance(king_win_rate, torch.Tensor) else king_win_rate,
+                    "game/learner_win_rate": learner_win_rate.detach().cpu().item() if isinstance(learner_win_rate, torch.Tensor) else learner_win_rate,
+
+                    # Meta parameters
+                    "meta/patience_criterion": patience_criterion.detach().cpu().item() if isinstance(patience_criterion, torch.Tensor) else patience_criterion,
+                    "meta/ent_lr_ratio": current_ent_coef / (scheduler.get_last_lr()[0].detach().cpu().item() + 1e-8) if isinstance(scheduler.get_last_lr()[0], torch.Tensor) else current_ent_coef / (scheduler.get_last_lr()[0] + 1e-8)
+                })
             
+            finally:
+                # force the macOS driver to release memory created by LSTM
+                del pool
+                if device.type == 'mps':
+                    torch.mps.empty_cache() # Clears Metal's internal buffers
+                gc.collect()
+            
+            # early exit logic, engage after king is chosen
+            if generation > 30:
+                if patience_criterion < (best_patience_criterion - min_delta):
+                    best_patience_criterion = patience_criterion
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+
+            # Player Evaluation
+            if generation % 20 == 0 and generation > 0:
+
+                num_games = 256
+                loss_history = evaluate_players(players, num_games=num_games, sequence_length=sequence_length)
+                
+                # if the king player lost only their equal share of games they stay
+                if loss_history[0] <= num_games / 3: 
+                    if generation == 20:
+                        best_player_weights = copy.deepcopy(players[0].state_dict())
+                        save_best_player(players[0], filename=king_filename)
+                # if no challenger proves significantly better, king stays
+                elif loss_history[0] > num_games / 3 and not any(loss_history[0] - loss > 0.05 * num_games for loss in loss_history[1:]):
+                    pass
+                # if none of the above conditions are met, we have a new king
+                else:
+                    new_king_idx = np.argmin(loss_history)
+                    best_player_weights = copy.deepcopy(players[new_king_idx].state_dict())
+                    save_best_player(players[new_king_idx], filename=king_filename)
+
+            if patience_counter >= patience:
+                wandb.log({"meta/early_stopped": True})
+                break
+            
+            # step the scheduler
+            scheduler.step()
+
+            debug_memory_usage()
+
+    except Exception as e:
+        print(f"An error occurred during sweep training: {e}")
+        raise e
+    
+    finally:
+        save_best_player(players[0], filename=king_filename)
+        wandb.finish()
+# endregion
+
+# region Training Parameters
+
+# # sweep config for weights & biases
+# sweep_config = {
+#     'method': 'bayes',
+#     'metric': {
+#         'name': 'meta/patience_criterion',
+#         'goal': 'minimize'   
+#     },
+#     'parameters': {
+#         'initial_lr': {
+#             'values': [5e-4, 1e-4, 5e-5, 1e-5]
+#         },
+#         'final_lr': {
+#             'values': [1e-6, 5e-6, 1e-5]
+#         },
+#         'initial_ent': {
+#             'values': [0.01, 0.05, 0.1, 0.2]
+#         },
+#         'final_ent': {
+#             'values': [0.001, 0.005, 0.01, 0.02]
+#         },
+#         'annealing_generations': {
+#             'values': [200, 300, 500, 750]
+#         }
+#     }
+# }
+
+# if __name__ == "__main__":
+
+#     try:
+#         multiprocessing.set_start_method('spawn', force=True)
+#     except RuntimeError:
+#         pass
+#     os.environ["WANDB_START_METHOD"] = "thread"
+    
+#     sweep_id = wandb.sweep(sweep_config, project="palace-patience-sweep-test")
+#     # sweep_id = "ma-casali-/palace-patience-sweep/2aqvzul5"  # Replace with your actual sweep ID after creating the sweep
+#     num_agents = multiprocessing.cpu_count() // 2 # Use half of the available CPU cores
+#     print(f"Starting sweep with {num_agents} parallel agents...")
+
+#     processes = []
+#     for _ in range(num_agents):
+#         p = multiprocessing.Process(target=wandb.agent, args=(sweep_id,), kwargs={'function': sweep_train, 'count': 40})
+#         p.start()
+#         processes.append(p)
+
+#     for p in processes:
+#         p.join()
+
+
+# training length
+num_generations = 1000
+batch_size = 256
+
+# learning rate
+initial_lr = 1e-4
+final_lr = 1e-5
+
+# entropy coefficient parameters
+initial_ent = 0.01
+final_ent = 0.001
+
+# weightd decay
+weight_decay = 1e-5
+
+last_king_loss = 0.0
+
+# player parameters
+sequence_length = 6 # number of actions to track in history
+shared_player = PalacePlayer().to(device)
+shared_player.apply(init_weights)
+players = [shared_player for _ in range(3)]
+
+# separate parameters for weight decay
+decay_params = []
+non_decay_params = []
+no_decay_names = ['bias', 'norm', 'layer_norm', 'ln', 'bn']
+for name, param in shared_player.named_parameters():
+    if any(nd in name.lower() for nd in no_decay_names) or param.ndim == 1:
+        non_decay_params.append(param)
+    else:
+        decay_params.append(param)
+
+# optimizer
+optimizer = torch.optim.AdamW([
+    {'params': decay_params, 'weight_decay': weight_decay},
+    {'params': non_decay_params, 'weight_decay': 0.0}
+], lr=initial_lr)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=200, T_mult=2, eta_min=final_lr)
+
+# level tracking
+level_wins = torch.zeros(4, device = device)
+level_counts = torch.zeros(4, device = device)
+current_level_probs = [0.0, 0.0, 0.0, 1.0] # start all at level 3
+
+# misc. parameter initializations
+best_player_weights = None
+delta_smoothed_loss = None
+patience = 50
+best_patience_criterion = 1.0 
+patience_counter = 0
+min_delta = 0.001
+# endregion
+
+# region WANDB Initialization
+wandb.init(
+    project="palace-ai",
+    name="vectorized-training-run",
+    config={
+        "num_generations": num_generations,
+        "batch_size": batch_size,
+        "initial_lr": initial_lr,
+        "final_lr": final_lr,
+        "entropy_start": initial_ent,
+        "entropy_end": final_ent,
+        "sequence_length": sequence_length,
+    }
+)
+
+wandb.watch(shared_player, log="all", log_freq=20)
+# endregion
+
+try:
+    
+    for generation in range(num_generations):
+        start_time = time.perf_counter()
+
+        pool = NSAutoreleasePool.alloc().init()
+        try:
+
+            # Prepare players for this generation
+            b_lp, b_rew, b_ent, player_counters, stalemate_rate, level_wins, level_counts, king_win_rate, learner_win_rate = training_step(players, best_player_weights, batch_size, sequence_length, level_wins, level_counts, current_level_probs)
+            mean_turns = player_counters.sum(dim=0).float().mean().item()
+            patience_criterion = (stalemate_rate + mean_turns / 300.0) / 2.0
+
             # Update level distribution based on performance
             current_level_probs = update_level_distribution(level_wins.cpu().numpy(), level_counts.cpu().numpy(), current_level_probs)
 
             # adapt entropy coefficient according to learning rate schedule
-            current_ent_coef = get_dynamic_entropy(generation, start_ent=config.initial_ent, end_ent=config.final_ent)
+            current_ent_coef = get_dynamic_entropy(generation, start_ent=initial_ent, end_ent=final_ent)
+
+            total_norm = torch.nn.utils.clip_grad_norm_(shared_player.parameters(), max_norm=0.5).detach().cpu().item()
+            rnn_norm = sum(p.grad.detach().data.norm(2).item() ** 2 for p in shared_player.rnn.parameters() if p.grad is not None) ** 0.5
 
             # Update using the accumulated batch data
             total_loss = finish_batch_update(
@@ -494,287 +710,110 @@ def sweep_train():
             # W&B can log dictionaries directly, making it easy to compare level behaviors
             level_dist_dict = {f"level_{i}": prob for i, prob in enumerate(current_level_probs)}
 
-            # 2. Log to Weights & Biases
-            wandb.log({
-                "generation": generation,
-                
-                # Training Dynamics
-                "train/loss": total_loss,
-                "train/learning_rate": scheduler.get_last_lr()[0],
-                "train/entropy_coefficient": current_ent_coef,
-                
-                # Game Performance
-                "game/stalemate_rate": stalemate_rate,
-                "game/mean_turns_taken": mean_turns,
-                
-                # Level Strategy
-                **{f"level_probs/{k}": v for k, v in level_dist_dict.items()},
-                
-                # Optional: Log the relationship (Global exploration health)
-                "meta/ent_lr_ratio": current_ent_coef / (scheduler.get_last_lr()[0] + 1e-8)
-            })
-            
-            # early exit logic
-            patience_criterion = stalemate_rate * mean_turns / 300.0
-            if patience_criterion < (best_patience_criterion - min_delta):
-                best_patience_criterion = patience_criterion
-                patience_counter = 0
-            else:
-                patience_counter += 1
-            
-
-            # Player Evaluation
-            if generation % 20 == 0 and generation > 0:
-
-                num_games = 256
-                loss_history = evaluate_players(players, num_games=num_games, sequence_length=sequence_length)
-                
-                # if the king player lost only their equal share of games they stay
-                if loss_history[0] <= num_games / 3: 
-                    if generation == 20:
-                        best_player_weights = copy.deepcopy(players[0].state_dict())
-                        save_best_player(players[0], filename='temporary_king.pth')
-                # if no challenger proves significantly better, king stays
-                elif loss_history[0] > num_games / 3 and not any(loss_history[0] - loss > 0.05 * num_games for loss in loss_history[1:]):
-                    pass
-                # if none of the above conditions are met, we have a new king
+            # early exit logic, engage after king is chosen
+            if generation > 25:
+                if patience_criterion < (best_patience_criterion - min_delta):
+                    best_patience_criterion = patience_criterion
+                    patience_counter = 0
                 else:
-                    new_king_idx = np.argmin(loss_history)
-                    best_player_weights = copy.deepcopy(players[new_king_idx].state_dict())
-                    save_best_player(players[new_king_idx], filename='temporary_king.pth')
+                    patience_counter += 1
 
-            if generation > 20 and patience_counter >= patience:
-                wandb.log({"meta/early_stopped": True})
-                break
+        finally:
+            # force the macOS driver to release memory created by LSTM
+            del pool
+            if device.type == 'mps':
+                torch.mps.empty_cache() # Clears Metal's internal buffers
+            gc.collect()
+
+        # region Player Evaluation
+        if generation % 5 == 0 and generation >= 25:
             
-            # step the scheduler
-            scheduler.step()
+            num_games = 256
+            loss_history = evaluate_players(players, num_games=num_games, sequence_length=sequence_length)
+            loss_rates = [l / num_games for l in loss_history]
+            king_loss_rate = loss_rates[0]
+            best_challenger_idx = np.argmin(loss_history[1:]) + 1
+            best_challenger_loss_rate = loss_rates[best_challenger_idx]
+            
+            # if the king is performing poorly AND someone is better, switch
+            if king_loss_rate > 0.40 and best_challenger_loss_rate < king_loss_rate: 
+                reason = f"King underperformed significantly. {king_loss_rate:.2f} > 0.40 AND {best_challenger_loss_rate:.2f} < {king_loss_rate:.2f}"
+                new_king_idx = best_challenger_idx
+                patience_counter = 0
+            
+            # if the king is okay, but a challenger is noticeably better (2% buffer)
+            elif (king_loss_rate - best_challenger_loss_rate) > 0.02:
+                reason = f"Challenger outperformed king. {king_loss_rate:.2f} - {best_challenger_loss_rate:.2f} > 0.02"
+                new_king_idx = best_challenger_idx
+                patience_counter = 0
+            
+            else:
+                reason = "King retains throne."
+                new_king_idx = 0  # King stays
 
-    except Exception as e:
-        print(f"An error occurred during sweep training: {e}")
-        raise e
+            if new_king_idx != 0:
+                print(f"New King: Player {new_king_idx} ({reason})")
+                best_player_weights = copy.deepcopy(players[new_king_idx].state_dict())
+                save_best_player(players[new_king_idx], filename='temporary_king.pth')
+            elif new_king_idx == 0 and best_player_weights is None:
+                # First time assigning king
+                best_player_weights = copy.deepcopy(players[0].state_dict())
+                save_best_player(players[0], filename='temporary_king.pth')
+            
+            print(f"Loss history: {loss_history}")       
+            # endregion
+
+        if patience_counter >= patience:
+            wandb.log({"meta/early_stopped": True})
+            print(f"Early stopping at generation {generation} due to lack of improvement.")
+            break
+
+        end_time = time.perf_counter()
+        time_taken = end_time - start_time
+
+        # 2. Log to Weights & Biases
+        wandb.log({
+            # Gradient Norms
+            "grads/total_norm": total_norm,
+            "grads/rnn_norm": rnn_norm,
+
+            # Policy Values
+            "policy/mean_entropy": b_ent.mean().detach().cpu().item(),
+            "policy/max_prob_avg": torch.exp(b_lp[b_lp != 0]).mean().detach().cpu().item(),
+            "policy/mean_reward": b_rew.mean().detach().cpu().item(),
+            
+            # Training Dynamics
+            "train/loss": total_loss,
+            "train/learning_rate": scheduler.get_last_lr()[0],
+            "train/entropy_coefficient": current_ent_coef,
+            
+            # Game Performance
+            "game/stalemate_rate": stalemate_rate,
+            "game/mean_turns_taken": mean_turns,
+            "game/king_win_rate": king_win_rate,
+            "game/learner_win_rate": learner_win_rate,
+
+            # Patience Criterion
+            "meta/patience_criterion": patience_criterion,
+
+            # Performance Timing
+            "performance/step_duration": time_taken,
+            
+            # Optional: Log the relationship (Global exploration health)
+            "meta/ent_lr_ratio": current_ent_coef / (scheduler.get_last_lr()[0] + 1e-8)
+        })
+
+        # step the scheduler
+        scheduler.step()
+
+    save_best_player(players[0], filename='temporary_king.pth')
+
+except KeyboardInterrupt:
+    print("\n[INTERRUPT] Training paused by user. Saving current models...")
     
-    finally:
-        save_best_player(players[0], filename='temporary_king.pth')
-        wandb.finish()
-# endregion
-
-# region WANDB Initialization
-wandb.init(
-    project="palace-ai",
-    name="vectorized-training-run",
-    config={
-        "num_generations": 1000,
-        "batch_size": 256,
-        "initial_lr": 1e-4,
-        "final_lr": 1e-6,
-        "entropy_start": 0.05,
-        "entropy_end": 0.005,
-        "sequence_length": 6,
-    }
-)
-# endregion
-
-# region Training Parameters
-# plotter = LivePlot()
-
-# sweep config for weights & biases
-sweep_config = {
-    'method': 'bayes',
-    'metric': {
-        'name': 'train/loss',
-        'goal': 'minimize'   
-    },
-    'parameters': {
-        'initial_lr': {
-            'distribution': 'log_uniform_values',
-            'min': 1e-5,
-            'max': 1e-3
-        },
-        'final_lr': {
-            'distribution': 'log_uniform_values',
-            'min': 1e-6,
-            'max': 1e-5
-        },
-        'initial_ent': {
-            'values': [0.01, 0.05, 0.1, 0.2]
-        },
-        'final_ent': {
-            'values': [0.001, 0.005, 0.01, 0.02]
-        }
-    }
-}
-
-if __name__ == "__main__":
-    os.environ["WANDB_START_METHOD"] = "thread"
+    # Save the Learner (current weights being optimized)
+    torch.save(players[1].state_dict(), "learner_interrupted.pt")
     
-    sweep_id = wandb.sweep(sweep_config, project="palace-ai-sweeps")
-    num_agents = multiprocessing.cpu_count()
-    print(f"Starting sweep with {num_agents} parallel agents...")
-    processes = []
-    for _ in range(num_agents):
-        p = multiprocessing.Process(target=wandb.agent, args=(sweep_id,), kwargs={'function': sweep_train, 'count': 4})
-        p.start()
-        processes.append(p)
-
-    for p in processes:
-        p.join()
-
-
-# # training length
-# num_generations = 1000
-# batch_size = 256
-
-# # learning rate
-# initial_lr = 1e-4
-# final_lr = 1e-6
-
-# last_king_loss = 0.0
-
-# # player parameters
-# sequence_length = 6 # number of actions to track in history
-# shared_player = PalacePlayer().to(device)
-# players = [shared_player for _ in range(3)]
-
-# # optimizer
-# optimizer = torch.optim.Adam(shared_player.parameters(), lr=initial_lr)
-# scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=150, T_mult=2, eta_min=final_lr)
-
-# # level tracking
-# level_wins = torch.zeros(4, device = device)
-# level_counts = torch.zeros(4, device = device)
-# current_level_probs = [0.0, 0.0, 0.0, 1.0] # start all at level 3
-
-# # misc. parameter initializations
-# best_player_weights = None
-# delta_smoothed_loss = None
-
-# # endregion
-
-# # profiler = cProfile.Profile()
-# # profiler.enable()
-
-# try:
-    
-#     for generation in range(num_generations):
-#         start_time = time.perf_counter()
-
-#         # Prepare players for this generation
-#         b_lp, b_rew, b_ent, player_counters, stalemate_rate, level_wins, level_counts = training_step(players, best_player_weights, batch_size, sequence_length, level_wins, level_counts, current_level_probs)
-
-#         # Update level distribution based on performance
-#         current_level_probs = update_level_distribution(level_wins.cpu().numpy(), level_counts.cpu().numpy(), current_level_probs)
-
-#         # adapt entropy coefficient according to learning rate schedule
-#         current_ent_coef = get_dynamic_entropy(generation)
-
-#         # Update using the accumulated batch data
-#         print("Calculating and backpropagating loss...")
-#         total_loss = finish_batch_update(
-#             optimizer, 
-#             b_lp, b_ent, b_rew, player_counters,
-#             ent_coef=current_ent_coef, 
-#             king_available=(best_player_weights is not None)
-#         )           
-
-#         # 1. Prepare level distribution for logging
-#         # W&B can log dictionaries directly, making it easy to compare level behaviors
-#         level_dist_dict = {f"level_{i}": prob for i, prob in enumerate(current_level_probs)}
-
-#         # 2. Log to Weights & Biases
-#         wandb.log({
-#             "generation": generation,
-            
-#             # Training Dynamics
-#             "train/loss": total_loss,
-#             "train/learning_rate": scheduler.get_last_lr()[0],
-#             "train/entropy_coefficient": current_ent_coef,
-            
-#             # Game Performance
-#             "game/stalemate_rate": stalemate_rate,
-#             "game/mean_turns_taken": player_counters.sum(dim=0).float().mean().item(),
-            
-#             # Level Strategy
-#             **{f"level_probs/{k}": v for k, v in level_dist_dict.items()},
-            
-#             # Optional: Log the relationship (Global exploration health)
-#             "meta/ent_lr_ratio": current_ent_coef / (scheduler.get_last_lr()[0] + 1e-8)
-# })
-
-#         print("\n" + "="*50)
-#         print(f"Generation {generation} completed.")
-#         print(f"Loss = {total_loss:.4f}, \nLR={scheduler.get_last_lr()[0]:.6f}, \nEntropy Coef={current_ent_coef:.4f}, \nStalemate Rate={stalemate_rate:.4f}")
-#         print(f"Mean Turns Taken: {player_counters.sum(dim=0).float().mean().item():.2f}")
-#         print(f"Level Distribution Probabilities: {[f'{prob:.2f}' for prob in current_level_probs]}")
-#         print("="*50 + "\n")
-        
-#         avg_rewards = []
-#         for p_idx in range(b_rew.shape[0]): # b_rew shape: (NumPlayers, BatchSize, MaxTurns)
-#             total_rewards_per_game = b_rew[p_idx].sum(dim=1) 
-#             avg_rewards.append(total_rewards_per_game.mean().item())
-
-#         loss_val = total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss
-
-#         # delta_smoothed_loss, delta_smoothed_reward = plotter.update(
-#         #     generation, 
-#         #     avg_rewards, 
-#         #     loss_val, 
-#         #     lr = scheduler.get_last_lr()[0],
-#         #     entropy = current_ent_coef,
-#         #     stalemate_rate = stalemate_rate*100.0,
-#         #     game_length = player_counters.sum(dim=0).float().mean().item()
-#         # )
-
-#         # region Player Evaluation
-#         if generation % 20 == 0 and generation > 0:
-            
-#             print(f"Evaluating generation {generation} players against current best...")
-            
-#             num_games = 256
-#             loss_history = evaluate_players(players, num_games=num_games, sequence_length=sequence_length)
-            
-#             # if the king player lost only their equal share of games they stay
-#             if loss_history[0] <= num_games / 3: 
-#                 print(f"King Player lost {loss_history[0]} games and retains the throne.")
-#                 if generation == 20:
-#                     best_player_weights = copy.deepcopy(players[0].state_dict())
-#                     save_best_player(players[0], filename='temporary_king.pth')
-#             # if no challenger proves significantly better, king stays
-#             elif loss_history[0] > num_games / 3 and not any(loss_history[0] - loss > 0.05 * num_games for loss in loss_history[1:]):
-#                 print(f"King Player lost {loss_history[0]} games but no challenger proved superior.")
-#             # if none of the above conditions are met, we have a new king
-#             else:
-#                 new_king_idx = np.argmin(loss_history)
-#                 print(f"A new king player has emerged (Player {new_king_idx}) with only {loss_history[new_king_idx]} losses!")
-#                 best_player_weights = copy.deepcopy(players[new_king_idx].state_dict())
-#                 save_best_player(players[new_king_idx], filename='temporary_king.pth')
-            
-#             print(f"Loss history: {loss_history}")
-            
-#             # endregion
-
-#         end_time = time.perf_counter()
-#         print(f"Generation {generation} took {end_time - start_time:.2f} seconds.\n")
-
-#         # step the scheduler
-#         scheduler.step()
-
-#     save_best_player(players[0], filename='temporary_king.pth')
-
-# except KeyboardInterrupt:
-#     print("\n[INTERRUPT] Training paused by user. Saving current models...")
-    
-#     # Save the Learner (current weights being optimized)
-#     torch.save(players[1].state_dict(), "learner_interrupted.pt")
-    
-#     # Save the King (the current best performer)
-#     save_best_player(players[0], filename='temporary_king.pth')
-#     print("Models saved successfully. Exiting.")
-
-#     # plt.savefig('training_progress.png')
-
-# # profiler.disable()
-# # stats = pstats.Stats(profiler).sort_stats('cumtime')
-# # stats.print_stats(20)
-
-# # plt.savefig('training_progress.png')
+    # Save the King (the current best performer)
+    save_best_player(players[0], filename='temporary_king.pth')
+    print("Models saved successfully. Exiting.")

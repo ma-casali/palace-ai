@@ -4,6 +4,7 @@ import tqdm
 import shap
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
+from matplotlib.patches import Patch
 # Ensure these match your actual file names
 from VectorizedCardGame import PalaceEnv 
 from PalacePlayer import PalacePlayer
@@ -35,7 +36,7 @@ def create_static_input_vector(env):
     #4. Global States
     top_cards = env.top_cards.unsqueeze(1).float()  # (B, 1)
     run_counts = env.run_count.unsqueeze(1).float()  # (B, 1)
-    drawpile_len = env.drawpile_counts.sum(dim=1, keepdim=True).float() # (B, 1)
+    drawpile_len = 52 - env.drawpile_ptrs.float().unsqueeze(1)  # (B, 1)
     parts.extend([top_cards, run_counts, drawpile_len])
 
     return torch.cat(parts, dim = 1).float()  # (B, 73)
@@ -60,6 +61,7 @@ def play_game(king_path, device="mps"):
     # Use lists for efficient gathering
     input_record = []
     action_record = []
+    acting_player = []
     action_idx_record = []
     num_turns = 0
     
@@ -84,10 +86,10 @@ def play_game(king_path, device="mps"):
             action = torch.argmax(probs[0]).item()
 
             # Record data only for player 0 that led to action
-            if current_p == 0:
-                action_idx_record.append(action)
-                input_record.append(static_obs[0].cpu().numpy())
-                action_record.append(action_history[0].cpu().numpy())
+            action_idx_record.append(action)
+            input_record.append(static_obs[0].cpu().numpy())
+            action_record.append(action_history[0].cpu().numpy())
+            acting_player.append(current_p)
 
             # step the environment
             env.step(torch.tensor([action], device=device))
@@ -103,14 +105,19 @@ def play_game(king_path, device="mps"):
     # np.stack adds a new dimension at the beginning (axis 0)
     final_input_record = np.stack(input_record) if input_record else np.array([])
     final_action_record = np.stack(action_record) if action_record else np.array([])
+    final_acting_player = np.array(acting_player) if acting_player else np.array([])
 
-    return final_input_record, final_action_record, action_idx_record
+    return final_input_record, final_action_record, final_acting_player, action_idx_record
 
-def analyze_game_dominance(king_path, input_record, action_record):
+def analyze_game_dominance(king_path, input_record, action_record, acting_player):
 
     king_model = PalacePlayer()
     king_model.load_state_dict(torch.load(king_path, map_location="cpu"))
     king_model.eval()
+
+    player0_mask = (acting_player == 0)
+    input_record = input_record[player0_mask]
+    action_record = action_record[player0_mask]
     
     def model_predict(data):
         # expand flattened data back to original shape
@@ -152,7 +159,7 @@ def analyze_game_dominance(king_path, input_record, action_record):
     
     return shap_values
 
-def plot_decision_component(shap_values, action_idx_record, action_record):
+def plot_decision_component(shap_values, action_idx_record, action_record, acting_player):
 
     num_turns = shap_values.values.shape[0]
     action_dim = 79
@@ -202,7 +209,7 @@ def plot_decision_component(shap_values, action_idx_record, action_record):
     history_impact = history_impact.reshape(num_turns, seq_len, action_dim)  # (num_turns, 6, 79)
     history_impact_sum = history_impact.sum(axis=2)  # (num_turns, 6)
     for t in range(seq_len):
-        impacts[f"History_T-{seq_len - t}"] = history_impact_sum[:, t]  # (num_turns,)
+        impacts[f"History: Turn -{seq_len - t}"] = history_impact_sum[:, t]  # (num_turns,)
 
     # Labels for action indices
     labels = []
@@ -255,12 +262,8 @@ def plot_decision_component(shap_values, action_idx_record, action_record):
     ]
 
     # Plotting
-    fig, [ax, ax2] = plt.subplots(2, 1, figsize=(12, 10), layout = "constrained")
-    turn_indices = np.arange(num_turns)
-    pos_bottom = np.zeros(num_turns)
-    neg_bottom = np.zeros(num_turns)
+    fig, ax = plt.subplots(1, 1, figsize=(12, 8), layout = "constrained")
     net_impact = np.zeros(num_turns)
-    turn = 0
 
     normalized_impacts = {}
     total_abs_impact = np.zeros(num_turns)
@@ -268,47 +271,170 @@ def plot_decision_component(shap_values, action_idx_record, action_record):
         total_abs_impact += np.abs(values)
     total_abs_impact[total_abs_impact == 0] = 1e-9  # prevent division by zero
 
+    turn_idx = 0
     bottom = 0
+    player0_turns = np.where(acting_player == 0)[0]
+    all_turns = np.concatenate((np.array([-1]), player0_turns, np.array([len(acting_player)]) if num_turns > player0_turns[-1] else np.array([len(acting_player) + 1])))
+    dist_left = np.diff(all_turns[:-1])
+    dist_right = np.diff(all_turns[1:])
+    widths = np.minimum(dist_left, dist_right) * 0.8
+    
     for key, values in impacts.items():
         net_impact += values 
         normalized_impacts[key] = np.abs(values) / total_abs_impact
-
-        ax.bar(turn_indices*3, normalized_impacts[key], bottom=bottom, label=key, color=color_hex[turn], width = 2.8)
-
+        ax.bar(player0_turns, normalized_impacts[key], bottom=bottom, label=key, color=color_hex[turn_idx], width = widths)
         bottom += normalized_impacts[key]
-        
-        turn += 1
+        turn_idx += 1
 
-    for turn in range(num_turns):
-        # Place text above the highest positive bar
-        y_pos = -0.05
-        ax.text(turn*3, 0, "|", ha='center', va='center', fontsize=12, color='black')
-        ax.text(turn*3, y_pos, labels[action_idx_record[turn]], ha='center', va='top', fontsize=8, rotation=90, fontweight='bold')
-        ax.text(turn*3 + 1, y_pos, "Opp. 1 " + labels[np.argmax(action_record[np.minimum(turn+1, num_turns - 1), -2])], ha='center', va='top', fontsize=8, rotation=90, color = "#6a5418")
-        ax.text(turn*3 + 2, y_pos, "Opp. 2 " + labels[np.argmax(action_record[np.minimum(turn+1, num_turns - 1), -1])], ha='center', va='top', fontsize=8, rotation=90, color = "#540d54")
+    y_pos = -0.05
+    player0_turn = 1
+    for turn in range(acting_player.shape[0]):
+        if acting_player[turn] == 0:
+            ax.text(turn, 0, "|", ha='center', va='center', fontsize=12, color='black')
+            ax.text(turn, y_pos, f"{player0_turn}. {labels[action_idx_record[turn]]}", ha='center', va='top', fontsize=8, rotation=90, fontweight='bold')
+            player0_turn += 1
+        elif acting_player[turn] == 1:
+            ax.text(turn, y_pos, "Opp. 1 " + labels[action_idx_record[turn]], ha='center', va='top', fontsize=8, rotation=90, color = "#6a5418")
+        elif acting_player[turn] == 2:
+            ax.text(turn, y_pos, "Opp. 2 " + labels[action_idx_record[turn]], ha='center', va='top', fontsize=8, rotation=90, color = "#540d54")
 
     ax.set_ylim([-0.5, 1.02])
     ax.set_xlabel("Turn")
     ax.set_ylabel("SHAP Value Impact")
-    ax.set_title("SHAP Value Decomposition of Player's Decisions Over Game Turns")
-    handles, legend_labels = ax.get_legend_handles_labels()
-    ax.legend(handles, legend_labels, loc = 'upper left', bbox_to_anchor=(1.05, 1))
+    ax.set_title("Portion of Impact on Chosen Action by Decision Component")
+    ax.set_xlim([-1.5, num_turns*3])
+    ax.axis('off')
 
-    ax2.plot(turn_indices*3, net_impact, color='black', marker = 'o', linewidth=2, label='Net SHAP Impact')
-    ax2.axhline(0, color='gray', linestyle='--')
-    ax2.grid(True)
-    ax2.set_xlabel("Turn")
-    ax2.set_ylabel("Net SHAP Impact")
+    flat_labels = [
+        "Player Hand", "Player Faceup", "Player Facedown", "", "", "",
+        "Opp. 1 Hand", "Opp. 1 Faceup", "Opp. 1 Facedown", "", "", "",
+        "Opp. 2 Hand", "Opp. 2 Faceup", "Opp. 2 Facedown", "", "", "",
+        "Discard Cards", "Top Card", "Run Count", "Drawpile Length", "", "",
+        "History Turn -6", "History Turn -5", "History Turn -4", "History Turn -3", "History Turn -2", "History Turn -1"
+    ]
+
+    all_handles_in_columns = [[] for _ in range(5)]
+    color_idx = 0
+    col_idx = 0
+    for item in flat_labels:
+
+        this_hex = color_hex[color_idx] if item != "" else "#ffffff"
+        patch = Patch(color=this_hex, label=item, visible=(item != ""))
+        color_idx = color_idx + 1 if item != "" else color_idx
+        
+        all_handles_in_columns[col_idx].append(patch)
+        col_idx = (col_idx + 1) % 5
+
+
+    row_ordered_handles = []
+    for row in zip(*all_handles_in_columns):
+        row_ordered_handles.extend(row)
+
+    ax.legend(
+        handles=row_ordered_handles,
+        ncol=5,
+        loc='upper center',
+        bbox_to_anchor=(0.5, 0.0),
+        frameon=False,
+        columnspacing=1.0
+    )
 
     plt.show()
 
+def save_explanation_file(shap_values, input_record, action_idx_record, acting_player, filename):
+
+    # mask input_record to only player 0 turns
+    player0_mask = (acting_player == 0)
+    input_record = input_record[player0_mask]
+    action_idx_record = np.array(action_idx_record)[player0_mask]
+
+    # Labels for action indices
+    labels = []
+    card_names = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"]
+    for action_idx in range(79):
+        if action_idx == 78:
+            labels.append("Pickup")
+        else:
+            card_rank = action_idx % 13
+            action_category = action_idx // 13
+            if action_category == 0:
+                labels.append(f"Played a {card_names[card_rank]}")
+            elif action_category > 0 and action_category < 4:
+                labels.append(f"Played {action_category + 1} {card_names[card_rank]}s")
+            elif action_category == 4:
+                labels.append(f"Played F-U {card_names[card_rank]}")
+            else:
+                labels.append(f"Played F-D")
+    
+    document_string = ""
+    num_turns = shap_values.values.shape[0]
+    action_dim = 79
+    seq_len = 6
+    for t in range(num_turns):
+        action_idx = np.argmax(shap_values.values[t].sum(axis=0))
+        document_string += f"{t + 1}. {labels[action_idx_record[t]]} because: "
+        
+        # get top three feature impacts on chosen action
+        feature_impacts = shap_values.values[t, :, action_idx]  # (num_features,)
+        top_feature_indices = np.argsort(-np.abs(feature_impacts))[:3]
+        for reason_idx, feature_idx in enumerate(top_feature_indices):
+            if reason_idx == 0:
+                prefix, suffix = "", ", "
+            elif reason_idx == 1:
+                prefix, suffix = "", ", and "
+            else:
+                prefix, suffix = "", ".\n"
+            if feature_idx >= seq_len * action_dim: # static features
+                idx = np.int32(feature_idx - seq_len * action_dim)
+                if idx < 13:
+                    mult = np.int32(input_record[t, idx])  # number of that card in hand
+                    document_string += f"{prefix}player had {mult} {card_names[idx]}{suffix}"
+                elif idx >= 13 and idx < 26:
+                    mult = np.int32(input_record[t, idx])
+                    document_string += f"{prefix}player had {mult} faceup {card_names[idx - 13]}{suffix}"
+                elif idx == 26:
+                    document_string += f"{prefix}player had {np.int32(input_record[t, idx])} facedown cards{suffix}"
+                elif idx == 27:
+                    document_string += f"{prefix}opponent 1 had {np.int32(input_record[t, idx])} cards in their hand{suffix}"
+                elif idx >= 28 and idx < 41:
+                    mult = np.int32(input_record[t, idx])
+                    document_string += f"{prefix}opponent 1 had {mult} faceup {card_names[idx - 28]}{suffix}"
+                elif idx == 41:
+                    document_string += f"{prefix}opponent 1 had {np.int32(input_record[t, idx])} facedown cards{suffix}"
+                elif idx == 42:
+                    document_string += f"{prefix}opponent 2 had {np.int32(input_record[t, idx])} cards in their hand{suffix}"
+                elif idx >= 43 and idx < 56:
+                    mult = np.int32(input_record[t, idx])
+                    document_string += f"{prefix}opponent 2 had {mult} faceup {card_names[idx - 43]}{suffix}"
+                elif idx == 56:
+                    document_string += f"{prefix}opponent 2 had {np.int32(input_record[t, idx])} facedown cards{suffix}"
+                elif idx >= 57 and idx < 70:
+                    # say which card in discard pile
+                    mult = np.int32(input_record[t, idx])
+                    document_string += f"{prefix}there was {mult} {card_names[idx - 57]} in the discard pile{suffix}"
+                elif idx == 70:
+                    document_string += f"{prefix}the top card on the pile was a {card_names[np.int32(input_record[t, idx])]}{suffix}"
+                elif idx == 71:
+                    document_string += f"{prefix}the run count was {np.int32(input_record[t, idx])}{suffix}"
+                elif idx == 72:
+                    document_string += f"{prefix}the drawpile had {np.int32(input_record[t, idx])} cards left{suffix}"
+            else:
+                history_turn = (feature_idx // action_dim) + 1
+                action_idx = (feature_idx - 73) % action_dim
+                document_string += f"{prefix}on turn -{seq_len - history_turn}, someone {labels[action_idx]}{suffix}"
+            
+    with open(filename, "w") as f:
+        f.write(document_string)
 
 king_path = "Palace_king.pth"
 print("Playing game...")
-input_record, action_record, action_idx_record = play_game(king_path, device = device)
+input_record, action_record, acting_player, action_idx_record = play_game(king_path, device = device)
 
 print("Analyzing game performance...")
-shap_results = analyze_game_dominance(king_path, input_record, action_record)
+shap_results = analyze_game_dominance(king_path, input_record, action_record, acting_player)
+
+print("Saving explanation file...")
+save_explanation_file(shap_results, input_record, action_idx_record, acting_player, "game_explanation.txt")
 
 print("Plotting decision components...")
-plot_decision_component(shap_results, action_idx_record, action_record)
+plot_decision_component(shap_results, action_idx_record, action_record, acting_player)

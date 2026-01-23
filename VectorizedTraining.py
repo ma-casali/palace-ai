@@ -603,15 +603,15 @@ def sweep_train():
 
 # training length
 num_generations = 1000
-batch_size = 256
+batch_size = 1024
 
 # learning rate
-initial_lr = 1e-4
-final_lr = 1e-5
+initial_lr = 1e-3
+final_lr = 1e-4
 
 # entropy coefficient parameters
-initial_ent = 0.01
-final_ent = 0.001
+initial_ent = 0.1
+final_ent = 0.0005
 
 # weightd decay
 weight_decay = 1e-5
@@ -619,7 +619,11 @@ weight_decay = 1e-5
 last_king_loss = 0.0
 
 # player parameters
-sequence_length = 6 # number of actions to track in history
+sequence_length = 3 # starting number of actions to track in history
+sequence_length_inc = 3 # increase history length every N generations
+sequence_length_inc_interval = 200 # increase history length every N generations
+
+# initialize shared player
 shared_player = PalacePlayer().to(device)
 shared_player.apply(init_weights)
 players = [shared_player for _ in range(3)]
@@ -692,6 +696,11 @@ try:
             # adapt entropy coefficient according to learning rate schedule
             current_ent_coef = get_dynamic_entropy(generation, start_ent=initial_ent, end_ent=final_ent)
 
+            # increase sequence length at intervals
+            if (generation > 0 and generation % sequence_length_inc_interval == 0):
+                sequence_length += sequence_length_inc
+                print(f"[GEN {generation}] Increasing sequence length to {sequence_length}")
+
             total_norm = torch.nn.utils.clip_grad_norm_(shared_player.parameters(), max_norm=0.5).detach().cpu().item()
             rnn_norm = sum(p.grad.detach().data.norm(2).item() ** 2 for p in shared_player.rnn.parameters() if p.grad is not None) ** 0.5
 
@@ -726,7 +735,7 @@ try:
         # region Player Evaluation
         if generation % 5 == 0 and generation >= 25:
             
-            num_games = 256
+            num_games = 1024
             loss_history = evaluate_players(players, num_games=num_games, sequence_length=sequence_length)
             loss_rates = [l / num_games for l in loss_history]
             king_loss_rate = loss_rates[0]

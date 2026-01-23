@@ -1,0 +1,24 @@
+2026-01-23 00:29:07,008 INFO    MainThread:21904 [wandb_setup.py:_flush():80] Current SDK version is 0.23.1
+2026-01-23 00:29:07,008 INFO    MainThread:21904 [wandb_setup.py:_flush():80] Configure stats pid to 21904
+2026-01-23 00:29:07,008 INFO    MainThread:21904 [wandb_setup.py:_flush():80] Loading settings from /Users/matthewcasali/.config/wandb/settings
+2026-01-23 00:29:07,008 INFO    MainThread:21904 [wandb_setup.py:_flush():80] Loading settings from /Users/matthewcasali/Documents/PythonScripts/palace-ai/wandb/settings
+2026-01-23 00:29:07,008 INFO    MainThread:21904 [wandb_setup.py:_flush():80] Loading settings from environment variables
+2026-01-23 00:29:07,009 INFO    MainThread:21904 [wandb_init.py:setup_run_log_directory():714] Logging user logs to /Users/matthewcasali/Documents/PythonScripts/palace-ai/wandb/run-20260123_002907-2naeyp3g/logs/debug.log
+2026-01-23 00:29:07,009 INFO    MainThread:21904 [wandb_init.py:setup_run_log_directory():715] Logging internal logs to /Users/matthewcasali/Documents/PythonScripts/palace-ai/wandb/run-20260123_002907-2naeyp3g/logs/debug-internal.log
+2026-01-23 00:29:07,009 INFO    MainThread:21904 [wandb_init.py:init():841] calling init triggers
+2026-01-23 00:29:07,009 INFO    MainThread:21904 [wandb_init.py:init():846] wandb.init called with sweep_config: {}
+config: {'num_generations': 1000, 'batch_size': 256, 'initial_lr': 0.0005, 'final_lr': 1e-05, 'entropy_start': 0.01, 'entropy_end': 0.001, 'sequence_length': 6, '_wandb': {}}
+2026-01-23 00:29:07,009 INFO    MainThread:21904 [wandb_init.py:init():889] starting backend
+2026-01-23 00:29:07,274 INFO    MainThread:21904 [wandb_init.py:init():892] sending inform_init request
+2026-01-23 00:29:07,301 INFO    MainThread:21904 [wandb_init.py:init():900] backend started and connected
+2026-01-23 00:29:07,315 INFO    MainThread:21904 [wandb_init.py:init():970] updated telemetry
+2026-01-23 00:29:07,336 INFO    MainThread:21904 [wandb_init.py:init():994] communicating run to backend with 90.0 second timeout
+2026-01-23 00:29:07,928 INFO    MainThread:21904 [wandb_init.py:init():1041] starting run threads in backend
+2026-01-23 00:29:07,995 INFO    MainThread:21904 [wandb_run.py:_console_start():2521] atexit reg
+2026-01-23 00:29:07,996 INFO    MainThread:21904 [wandb_run.py:_redirect():2369] redirect: wrap_raw
+2026-01-23 00:29:07,996 INFO    MainThread:21904 [wandb_run.py:_redirect():2438] Wrapping output streams.
+2026-01-23 00:29:07,996 INFO    MainThread:21904 [wandb_run.py:_redirect():2461] Redirects installed.
+2026-01-23 00:29:07,998 INFO    MainThread:21904 [wandb_init.py:init():1081] run started, returning control to user process
+2026-01-23 00:29:07,999 INFO    MainThread:21904 [wandb_watch.py:_watch():68] Watching
+2026-01-23 00:29:08,699 INFO    wandb-AsyncioManager-main:21904 [service_client.py:_forward_responses():80] Reached EOF.
+2026-01-23 00:29:08,699 INFO    wandb-AsyncioManager-main:21904 [mailbox.py:close():137] Closing mailbox, abandoning 1 handles.

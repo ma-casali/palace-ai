@@ -249,13 +249,15 @@ class PalaceEnv:
             fail_batch_ids = facedown_batch_inds[is_fail]
             if fail_batch_ids.numel() > 0:
                 self.hands[fail_batch_ids, self.active_players[fail_batch_ids], chosen_ranks[is_fail]] += 1
+                rewards[fail_batch_ids, self.active_players[fail_batch_ids]] += cfg['pickup_base_penalty'] + cfg['pickup_per_card_penalty'] * self.discard_counts[fail_batch_ids].sum(dim=1)
+
                 self.discard_counts[fail_batch_ids, 1] = 0 # make sure no one picks up a three
                 self.hands[fail_batch_ids, self.active_players[fail_batch_ids]] += self.discard_counts[fail_batch_ids] # pick up on fail
                 self.discard_counts[fail_batch_ids] = torch.zeros_like(self.discard_counts[fail_batch_ids])
                 self.top_cards[fail_batch_ids] = -1
                 self.run_ranks[fail_batch_ids] = -1
                 self.run_count[fail_batch_ids] = 0
-                rewards[fail_batch_ids] += cfg['pickup_base_penalty'] + cfg['pickup_per_card_penalty'] * self.discard_counts[fail_batch_ids].sum(dim=1)
+                
 
             success_batch_ids = facedown_batch_inds[~is_fail]
             if success_batch_ids.numel() > 0:

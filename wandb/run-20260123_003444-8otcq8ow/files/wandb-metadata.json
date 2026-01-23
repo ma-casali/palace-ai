@@ -1,0 +1,37 @@
+{
+  "os": "macOS-15.7.3-arm64-arm-64bit",
+  "python": "CPython 3.9.6",
+  "startedAt": "2026-01-23T08:34:44.364427Z",
+  "program": "/Users/matthewcasali/Documents/PythonScripts/palace-ai/VectorizedTraining.py",
+  "codePath": "VectorizedTraining.py",
+  "codePathLocal": "VectorizedTraining.py",
+  "git": {
+    "remote": "git@github.com:ma-casali/palace-ai.git",
+    "commit": "349dd75ee6d7db51d5462a150253cfb535eaf82d"
+  },
+  "email": "casali.ma98@gmail.com",
+  "root": "/Users/matthewcasali/Documents/PythonScripts/palace-ai",
+  "host": "Lucass-MacBook-Pro.local",
+  "executable": "/Users/matthewcasali/Documents/PythonScripts/palace-ai/.venv/bin/python",
+  "cpu_count": 10,
+  "cpu_count_logical": 10,
+  "disk": {
+    "/": {
+      "total": "1995218165760",
+      "used": "869043748864"
+    }
+  },
+  "memory": {
+    "total": "34359738368"
+  },
+  "apple": {
+    "name": "Apple M1 Max",
+    "ecpuCores": 2,
+    "pcpuCores": 8,
+    "gpuCores": 24,
+    "memoryGb": 32,
+    "swapTotalBytes": "2147483648",
+    "ramTotalBytes": "34359738368"
+  },
+  "writerId": "qoc1cqcaqb4x98p7xowexiwa8ptpl408"
+}

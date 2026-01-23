@@ -205,7 +205,7 @@ def play_kings_against_kings(king_path):
     logger.save_stalemate_log(env.done, "stalemate_analysis.txt")
 
 def play_against_kings(king_path):
-    # ... [Keep environment and model setup as you have it] ...
+
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     batch_size = 1
     env = PalaceEnv(batch_size=batch_size, num_players=3, device=device)

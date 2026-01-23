@@ -5,11 +5,133 @@ import shap
 from VectorizedCardGame import PalaceEnv
 from PalacePlayer import PalacePlayer
 
-SCREEN_WIDTH, SCREEN_HEIGHT = 1000, 700
+SCREEN_WIDTH, SCREEN_HEIGHT = 1400, 900
 CARD_WIDTH, CARD_HEIGHT = 70, 100
 OVERLAP_SPACING = 30
 SPACING = 75
 FPS = 60
+
+class PalaceExplainer:
+    def __init__(self, model, background_path, device):
+        self.model = model
+        self.device = device
+        background = np.load(background_path)
+        self.explainer = shap.Explainer(self.model_predict, background)
+
+    def model_predict(self, data):
+        # expand flattened data back to original shape
+        X = torch.tensor(data, dtype=torch.float32, device = self.device)
+        batch_size = X.shape[0]
+        
+        # first 6 * 79 = 474 are action history
+        action_dim = 79
+        seq_len = 6
+        action_history_flat = X[:, :seq_len * action_dim] # (B, 474)
+        static_obs = X[:, seq_len * action_dim:] # (B, 82)
+        action_history = action_history_flat.view(batch_size, seq_len, action_dim) # (B, 6, 79)
+
+        # initialize hidden states to zero
+        h0 = torch.zeros(self.model.num_rnn_layers, batch_size, self.model.hidden_dim, device=self.device)
+        c0 = torch.zeros(self.model.num_rnn_layers, batch_size, self.model.hidden_dim, device=self.device)
+
+        # the model will see all actions as valid for SHAP analysis
+        dummy_mask = torch.ones((batch_size, 79), device=self.device)
+        with torch.no_grad():
+            logits, _ = self.model(action_history, static_obs, dummy_mask, (h0, c0))
+            return logits.cpu().numpy()
+        
+    def explain_turn(self, history, static, action_idx):
+
+        flat_hist = history.view(1, -1).cpu().numpy()  # (1, 474)
+        flat_static = static.cpu().numpy()
+        current_input = np.hstack((flat_hist, flat_static))  # (1, 556)
+
+        shap_values = self.explainer(current_input, max_evals=2048, batch_size=256)
+
+        return shap_values
+    
+    def get_turn_explanation(self, history, static, action_idx, current_player):
+        card_names = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"]
+        action_dim = 79
+        seq_len = 6
+        
+        # 1. Generate Action Labels
+        labels = []
+        for i in range(79):
+            if i == 78:
+                labels.append("picking up the pile")
+            else:
+                card_rank = i % 13
+                cat = i // 13
+                if cat == 0: labels.append(f"you play a {card_names[card_rank]}")
+                elif 0 < cat < 4: labels.append(f"you play {cat + 1} {card_names[card_rank]}s")
+                elif cat == 4: labels.append(f"you play face-up {card_names[card_rank]}")
+                else: labels.append(f"you play a face-down card")
+
+        # 2. Get SHAP impacts for this specific action
+        # This should return an array of size (474 + 73)
+        feature_impacts = self.explain_turn(history, static, action_idx)
+        feature_impacts = feature_impacts.values[0, :, action_idx]  # (547,)
+        
+        # 3. Build the explanation string
+        document_list = [f"The AI suggested {labels[action_idx]} because: "]
+        
+        # Get top three feature indices by absolute impact
+        top_feature_indices = np.argsort(-np.abs(feature_impacts))[:3]
+        
+        # Convert static tensor to numpy for easy indexing
+        static_np = static.squeeze().cpu().numpy()
+
+        for reason_idx, feature_idx in enumerate(top_feature_indices):
+            # Formatting prefixes/suffixes
+            if reason_idx == 0: prefix, suffix = "  1. ", ","
+            elif reason_idx == 1: prefix, suffix = "  2. ", ", and"
+            else: prefix, suffix = "  3. ", "."
+
+            if feature_idx >= seq_len * action_dim: # static features
+                idx = np.int32(feature_idx - seq_len * action_dim)
+                if idx < 13:
+                    mult = np.int32(static_np[idx])  # number of that card in hand
+                    document_list.append(f"{prefix}you have {mult} {card_names[idx]}{suffix}")
+                elif idx >= 13 and idx < 26:
+                    mult = np.int32(static_np[idx])
+                    document_list.append(f"{prefix}you have {mult} faceup {card_names[idx - 13]}{suffix}")
+                elif idx == 26:
+                    document_list.append(f"{prefix}you have {np.int32(static_np[idx])} facedown cards{suffix}")
+                elif idx == 27:
+                    document_list.append(f"{prefix}opponent 1 has {np.int32(static_np[idx])} cards in their hand{suffix}")
+                elif idx >= 28 and idx < 41:
+                    mult = np.int32(static_np[idx])
+                    document_list.append(f"{prefix}opponent 1 has {mult} faceup {card_names[idx - 28]}{suffix}")
+                elif idx == 41:
+                    document_list.append(f"{prefix}opponent 1 has {np.int32(static_np[idx])} facedown cards{suffix}")
+                elif idx == 42:
+                    document_list.append(f"{prefix}opponent 2 has {np.int32(static_np[idx])} cards in their hand{suffix}")
+                elif idx >= 43 and idx < 56:
+                    mult = np.int32(static_np[idx])
+                    document_list.append(f"{prefix}opponent 2 has {mult} faceup {card_names[idx - 43]}{suffix}")
+                elif idx == 56:
+                    document_list.append(f"{prefix}opponent 2 has {np.int32(static_np[idx])} facedown cards{suffix}")
+                elif idx >= 57 and idx < 70:
+                    # say which card in discard pile
+                    mult = np.int32(static_np[idx])
+                    if mult == 1:
+                        document_list.append(f"{prefix}there is 1 {card_names[idx - 57]} in the discard pile{suffix}")
+                    else:
+                        document_list.append(f"{prefix}there are {mult} {card_names[idx - 57]}s in the discard pile{suffix}")
+                elif idx == 70:
+                    document_list.append(f"{prefix}the top card on the pile is a {card_names[np.int32(static_np[idx])]}{suffix}")
+                elif idx == 71:
+                    document_list.append(f"{prefix}the run count is {np.int32(static_np[idx])}{suffix}")
+                elif idx == 72:
+                    document_list.append(f"{prefix}the drawpile has {np.int32(static_np[idx])} cards left{suffix}")
+            else:
+                history_turn = (feature_idx // action_dim) + 1
+                action_idx = (feature_idx - 73) % action_dim
+                document_list.append(f"{prefix}on turn -{seq_len - history_turn}, someone {labels[action_idx]}{suffix}")
+
+        return document_list
+
 
 class PalaceUI:
     def __init__(self, king_path, device):
@@ -31,6 +153,11 @@ class PalaceUI:
         self.king_model.load_state_dict(torch.load(king_path, map_location=device))
         self.king_model.eval()
 
+        # explainer class
+        self.ai_explainer = PalaceExplainer(self.king_model, "shap_background.npy", device)
+        self.show_insight_overlay = False
+        self.current_explanation = ""
+
         # rnn state tracking
         self.action_history = torch.zeros((1, 6, 79)).to(device)
         self.hidden_states = {
@@ -46,6 +173,7 @@ class PalaceUI:
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("Georgia", 24)
         self.big_font = pygame.font.SysFont("Georgia", 48)
+        self.small_font = pygame.font.SysFont("Georgia", 14)
         self.rank_strings = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
         
         self.clickable_hand = {}
@@ -67,6 +195,9 @@ class PalaceUI:
             1: (SCREEN_WIDTH//4, CARD_HEIGHT // 2),                             # Top-Left - AI Player
             2: (SCREEN_WIDTH//4 * 3, CARD_HEIGHT // 2)               # Top-Right - AI Player 
         }
+
+        icon_size = 40
+        self.help_icon_rect = pygame.Rect(self.player_positions[0][0] + CARD_WIDTH * 2, self.player_positions[0][1], icon_size, icon_size)
 
         # Colors to use
         self.GOLD = (255, 215, 0)
@@ -100,6 +231,37 @@ class PalaceUI:
             self.draw_rules_overlay()
 
         pygame.display.flip()
+
+    # region DRAW_INSIGHT_OVERLAY
+    def draw_insight_overlay(self, explanation_text):
+        # dimensions and position
+        box_width = SCREEN_WIDTH // 3
+        box_height = SCREEN_HEIGHT // 2
+        box_rect = pygame.Rect(
+            0, 0,
+            box_width, box_height
+        )
+        box_rect.center = (SCREEN_WIDTH // 6, SCREEN_HEIGHT // 4 * 3)
+
+        # Draw the background (Semi-transparent dark blue)
+        overlay = pygame.Surface((box_width, box_height), pygame.SRCALPHA)
+        overlay.fill((10, 25, 50, 235)) 
+        self.screen.blit(overlay, box_rect.topleft)
+        
+        # Gold border
+        pygame.draw.rect(self.screen, self.GOLD, box_rect, 3, border_radius=12)
+
+        # 4. Blit lines to screen
+        y_offset = box_rect.y
+        padding = 20
+        for line in explanation_text:
+            text_surf = self.small_font.render(line, True, self.WHITE)
+            self.screen.blit(text_surf, (box_rect.x + padding, y_offset + padding))
+            y_offset += 30 # Line spacing
+
+        # Instruction to close
+        close_txt = self.font.render("Click anywhere to close", True, self.GOLD)
+        self.screen.blit(close_txt, (box_rect.centerx - close_txt.get_width()//2, box_rect.bottom - 35))
 
     # region DRAW_RULES_OVERLAY
     def draw_rules_overlay(self):
@@ -220,6 +382,8 @@ class PalaceUI:
     # region CONVERT_SELECTION_TO_ACTION
     def convert_selection_to_action(self):
 
+        remaining_cards = torch.where(self.env.face_down_piles[0, 0] == 1)[0]
+
         current_hand = self.get_flat_hand(self.env.hands[0, 0])
         if len(current_hand) != 0 and self.selected_hand_indices:
             selected_ranks = [current_hand[i] for i in self.selected_hand_indices]
@@ -231,6 +395,10 @@ class PalaceUI:
             print(self.selected_faceup_indices)
             return 52 + self.selected_faceup_indices[0]  # Face-up card action index
         
+        if remaining_cards.numel() == 0:
+            print("Warning: Tried to play facedown card, but none are left.")
+            return 78
+        
         if len(current_hand) == 0 and self.env.face_up_piles[0, 0].sum().item() == 0 and self.selected_facedown_indices:
             # make this a random choice among facedown cards
             return torch.where(self.env.face_down_piles[0, 0] == 1)[0][0].item() + 65
@@ -241,11 +409,11 @@ class PalaceUI:
     def get_ai_action(self, player_idx):
         with torch.no_grad():
             masks = self.env.get_valid_mask()
-            static_obs = self.create_static_input_vector(self.env)
+            self.static_obs = self.create_static_input_vector(self.env)
             h, c = self.hidden_states[player_idx]
             probs, (h_new, c_new) = self.king_model(
                 self.action_history,
-                static_obs,
+                self.static_obs,
                 masks[0],
                 hidden_state=(h, c)
             )
@@ -423,6 +591,18 @@ class PalaceUI:
                 # 4. REGISTER CLICK ZONE
                 self.clickable_hand[tuple(rect)] = {'id': i, 'rank': rank_idx}
 
+        # Draw Help Icon
+        mouse_pos = pygame.mouse.get_pos()
+        help_color = self.OFFWHITE if self.help_icon_rect.collidepoint(mouse_pos) else self.adjust_color(self.OFFWHITE, 1.2)
+        pygame.draw.circle(self.screen, self.GOLD, self.help_icon_rect.center, self.help_icon_rect.width // 2)
+        pygame.draw.circle(self.screen, help_color, self.help_icon_rect.center, self.help_icon_rect.width // 2, 2)
+
+        quest_surf = self.font.render("?", True, (0, 0, 0))
+        self.screen.blit(quest_surf, (self.help_icon_rect.centerx - quest_surf.get_width()//2, self.help_icon_rect.centery - quest_surf.get_height()//2))
+
+        if self.show_insight_overlay:
+            self.draw_insight_overlay(self.current_explanation)
+
         pygame.display.flip()
 
     # region GET_CARD_SURFACE
@@ -440,43 +620,11 @@ class PalaceUI:
         surf.blit(rank_text, (5, 5))
 
         return surf
-    
-class PalaceExplainer:
-    def __init__(self, model, background_path, device):
-        self.model = model
-        self.device = device
-        background = np.load(background_path)
-        self.explainer = shap.Explainer(self.model_preict, background)
-
-    def model_predict(self, data):
-        # expand flattened data back to original shape
-        X = torch.tensor(data, dtype=torch.float32, device = self.device)
-        batch_size = X.shape[0]
-        
-        # first 6 * 79 = 474 are action history
-        action_dim = 79
-        seq_len = 6
-        action_history_flat = X[:, :seq_len * action_dim] # (B, 474)
-        static_obs = X[:, seq_len * action_dim:] # (B, 82)
-        action_history = action_history_flat.view(batch_size, seq_len, action_dim) # (B, 6, 79)
-
-        # initialize hidden states to zero
-        h0 = torch.zeros(self.model.num_rnn_layers, batch_size, self.model.hidden_dim, device=self.device)
-        c0 = torch.zeros(self.model.num_rnn_layers, batch_size, self.model.hidden_dim, device=self.device)
-
-        # the model will see all actions as valid for SHAP analysis
-        dummy_mask = torch.ones((batch_size, 79), device=self.device)
-        with torch.no_grad():
-            logits, _ = self.model(action_history, static_obs, dummy_mask, (h0, c0))
-            return logits.numpy()
-
 
 # region RUN_GAME
 def run_game(king_path):
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     ui = PalaceUI(king_path, device)
-    ui.env.reset([ui.king_model] * 3, levels = [1.0, 0.0, 0.0, 0.0])
-
     running = True
     while running:
 
@@ -517,6 +665,21 @@ def run_game(king_path):
                         for event in pygame.event.get():
                             if event.type == pygame.QUIT: return
                             if event.type == pygame.MOUSEBUTTONDOWN:
+                                if ui.help_icon_rect.collidepoint(event.pos):
+                                    think_text = ui.font.render("Thinking...", True, (255, 255, 255))
+                                    ui.screen.blit(think_text, ui.help_icon_rect.bottomright)
+
+                                    pygame.display.flip()
+
+                                    current_player = ui.env.active_players[0].item()
+                                    explanation = ui.ai_explainer.get_turn_explanation(ui.action_history, ui.static_obs, suggested_action, current_player)
+
+                                    ui.current_explanation = explanation
+                                    ui.show_insight_overlay = True
+
+                                elif ui.show_insight_overlay:
+                                    ui.show_insight_overlay = False
+
                                 zone, item_id, rank = ui.handle_click(event.pos)
                                 if zone == 'hand':
                                     if item_id in ui.selected_hand_indices:
@@ -533,6 +696,20 @@ def run_game(king_path):
                                 elif zone == 'pile':
                                     action_taken = ui.convert_selection_to_action()
                                     if action_taken in valid_actions:
+                                        if action_taken < 78 and action_taken >= 65:
+                                            ui.env.step(torch.tensor([action_taken], device=device))
+                                            start_pos =  (ui.player_positions[0][0] - (CARD_WIDTH + 5) * 3 // 2 + (CARD_WIDTH + 5),
+                                                            ui.player_positions[0][1])
+                                            end_pos = ui.pile_rect.topleft
+                                            card_surf = ui.get_card_surface( ui.env.chosen_ranks[0].item() )
+                                            ui.animate_card_move( card_surf, start_pos, end_pos, duration = 50 )
+
+                                            while ui.animations:
+                                                ui.clock.tick(FPS)
+                                                ui.render_game(suggested_action, confidence)
+                                                ui.run_animations()
+                                                pygame.display.flip()
+
                                         waiting = False
                                     else:
                                         print("Invalid action selected. Please try again.")
@@ -587,7 +764,8 @@ def run_game(king_path):
 
                 # Step the environment
                 if action_taken is not None :
-                    ui.env.step(torch.tensor([action_taken], device=device))
+                    if not (current_player == 0 and action_taken >= 65 and action_taken < 78):
+                        ui.env.step(torch.tensor([action_taken], device=device))
                     ui.update_history(action_taken)
                     ui.selected_hand_indices = []
                     ui.selected_faceup_indices = []

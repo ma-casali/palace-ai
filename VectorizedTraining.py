@@ -388,8 +388,6 @@ def evaluate_players(players, num_games=100, sequence_length=6, max_turns=500):
                 losses.scatter_add_(0, relevant_losers, ones)
 
             active_envs &= ~dones
-        
-        print(f"Total complete games: {num_games - active_envs.sum().item()} out of {num_games}")
 
     return losses.cpu().numpy()
 

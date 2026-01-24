@@ -2,14 +2,48 @@ import pygame
 import torch
 import numpy as np
 import shap
+import os
+import datetime
 from VectorizedCardGame import PalaceEnv
 from PalacePlayer import PalacePlayer
 
-SCREEN_WIDTH, SCREEN_HEIGHT = 1400, 900
+SCREEN_WIDTH, SCREEN_HEIGHT = 1200, 800
 CARD_WIDTH, CARD_HEIGHT = 70, 100
 OVERLAP_SPACING = 30
 SPACING = 75
 FPS = 60
+
+class GroundTruthLogger:
+    def __init__(self, save_dir="ground_truth_logs"):
+        self.save_dir = save_dir
+        self.buffer = []
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+
+    def log_step(self, static_obs, action_history, action_taken, is_human_correction=False):
+        # We store copies to prevent issues with changing pointers
+        self.buffer.append({
+            'static_obs': static_obs.cpu().numpy().copy(),
+            'action_history': action_history.cpu().numpy().copy(),
+            'action': action_taken,
+            'is_human_correction': is_human_correction
+        })
+
+    def save_game(self):
+        if not self.buffer: return
+        
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = os.path.join(self.save_dir, f"game_{timestamp}.npz")
+        
+        # Unzip buffer into arrays
+        static_data = np.array([step['static_obs'] for step in self.buffer])
+        hist_data = np.array([step['action_history'] for step in self.buffer])
+        actions = np.array([step['action'] for step in self.buffer])
+        human_corrections = np.array([step['is_human_correction'] for step in self.buffer])
+        
+        np.savez_compressed(filename, static=static_data, hist=hist_data, actions=actions, human_corrections=human_corrections)
+        print(f"Game saved with {len(self.buffer)} steps to {filename}")
+        self.buffer = [] # Reset for next game
 
 class PalaceExplainer:
     def __init__(self, model, background_path, device):
@@ -132,7 +166,6 @@ class PalaceExplainer:
 
         return document_list
 
-
 class PalaceUI:
     def __init__(self, king_path, device):
         self.device = device
@@ -157,6 +190,9 @@ class PalaceUI:
         self.ai_explainer = PalaceExplainer(self.king_model, "shap_background.npy", device)
         self.show_insight_overlay = False
         self.current_explanation = ""
+
+        # Logger initialization
+        self.logger = GroundTruthLogger()
 
         # rnn state tracking
         self.action_history = torch.zeros((1, 6, 79)).to(device)
@@ -392,7 +428,6 @@ class PalaceUI:
             return (len(selected_ranks) - 1) * 13 + rank  # Calculate action index for hand cards
         
         if len(current_hand) == 0 and self.selected_faceup_indices:
-            print(self.selected_faceup_indices)
             return 52 + self.selected_faceup_indices[0]  # Face-up card action index
         
         if remaining_cards.numel() == 0:
@@ -649,6 +684,8 @@ def run_game(king_path):
         if ui.state == "MENU":
             ui.render_menu()
         elif ui.state == "GAME":
+            # initialize rewards for player
+            player_reward = 0.0
             while not ui.env.done.all():
                 current_player = ui.env.active_players[0].item()
                 action_taken = None
@@ -696,8 +733,15 @@ def run_game(king_path):
                                 elif zone == 'pile':
                                     action_taken = ui.convert_selection_to_action()
                                     if action_taken in valid_actions:
+                                        # log the action as a ground truth step and determine if the human corrected
+                                        ui.logger.log_step(ui.static_obs, ui.action_history, action_taken, suggested_action != action_taken)
                                         if action_taken < 78 and action_taken >= 65:
-                                            ui.env.step(torch.tensor([action_taken], device=device))
+                                            turn_reward, _ = ui.env.step(torch.tensor([action_taken], device=device))
+                                            player_reward += turn_reward[0, 0].item()
+                                            ui.update_history(action_taken)
+                                            ui.selected_hand_indices = []
+                                            ui.selected_faceup_indices = []
+                                            ui.selected_facedown_indices = False
                                             start_pos =  (ui.player_positions[0][0] - (CARD_WIDTH + 5) * 3 // 2 + (CARD_WIDTH + 5),
                                                             ui.player_positions[0][1])
                                             end_pos = ui.pile_rect.topleft
@@ -765,11 +809,15 @@ def run_game(king_path):
                 # Step the environment
                 if action_taken is not None :
                     if not (current_player == 0 and action_taken >= 65 and action_taken < 78):
-                        ui.env.step(torch.tensor([action_taken], device=device))
+                        player_rewards, _ = ui.env.step(torch.tensor([action_taken], device=device))
+                        player_reward += player_rewards[0, 0].item()
                     ui.update_history(action_taken)
                     ui.selected_hand_indices = []
                     ui.selected_faceup_indices = []
                     ui.selected_facedown_indices = False
+
+            print(f"Game Over! Your Reward: {player_reward:.2f}")
+            ui.logger.save_game()
 
         ui.state = "MENU"
 

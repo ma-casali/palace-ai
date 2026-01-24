@@ -1,0 +1,16 @@
+1. Played 2 Ks because: the drawpile had 25 cards left, player had 2 K, and player had 2 faceup A.
+2. Pickup because: the drawpile had 21 cards left, there was 2 K in the discard pile, and player had 2 8.
+3. Played 2 Ks because: the drawpile had 19 cards left, player had 2 K, and player had 2 8.
+4. Played 2 8s because: there was 2 K in the discard pile, player had 2 8, and there was 1 5 in the discard pile.
+5. Played a 7 because: there was 3 8 in the discard pile, there was 2 K in the discard pile, and the top card on the pile was a J.
+6. Played a 10 because: there was 4 8 in the discard pile, there was 2 K in the discard pile, and player had 1 10.
+7. Played a 6 because: the drawpile had 7 cards left, player had 2 faceup A, and player had 3 facedown cards.
+8. Played a 2 because: there was 1 5 in the discard pile, player had 1 4, and there was 1 6 in the discard pile.
+9. Played a 10 because: player had 1 10, the top card on the pile was a Q, and there was 1 5 in the discard pile.
+10. Played a 4 because: the drawpile had 0 cards left, player had 1 4, and there was 0 K in the discard pile.
+11. Played F-U Q because: opponent 2 had 1 cards in their hand, there was 1 9 in the discard pile, and there was 1 2 in the discard pile.
+12. Played F-U A because: the drawpile had 0 cards left, there was 0 6 in the discard pile, and there was 0 5 in the discard pile.
+13. Played F-U A because: the drawpile had 0 cards left, player had 1 faceup A, and opponent 1 had 0 cards in their hand.
+14. Played F-D because: the drawpile had 0 cards left, player had 0 faceup A, and opponent 1 had 0 cards in their hand.
+15. Played F-D because: the drawpile had 0 cards left, opponent 2 had 10 cards in their hand, and player had 2 facedown cards.
+16. Played F-D because: player had 1 facedown cards, the drawpile had 0 cards left, and player had 0 faceup A.

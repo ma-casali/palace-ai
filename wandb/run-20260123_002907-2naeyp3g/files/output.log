@@ -1,8 +1,0 @@
-Traceback (most recent call last):
-  File "/Users/matthewcasali/Documents/PythonScripts/palace-ai/VectorizedTraining.py", line 685, in <module>
-    b_lp, b_rew, b_ent, player_counters, stalemate_rate, level_wins, level_counts, king_win_rate, learner_win_rate = training_step(players, best_player_weights, batch_size, sequence_length, level_wins, level_counts, current_level_probs)
-  File "/Users/matthewcasali/Documents/PythonScripts/palace-ai/VectorizedTraining.py", line 240, in training_step
-    rewards, dones = env.step(action_indices)
-  File "/Users/matthewcasali/Documents/PythonScripts/palace-ai/VectorizedCardGame.py", line 258, in step
-    rewards[fail_batch_ids] += cfg['pickup_base_penalty'] + cfg['pickup_per_card_penalty'] * self.discard_counts[fail_batch_ids].sum(dim=1)
-RuntimeError: The size of tensor a (3) must match the size of tensor b (44) at non-singleton dimension 1

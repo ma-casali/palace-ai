@@ -10,6 +10,8 @@ import time
 import os
 import multiprocessing
 import gc
+from torch.utils.data import Dataset
+import glob
 from Cocoa import NSAutoreleasePool
 
 from VectorizedCardGame import PalaceEnv
@@ -18,6 +20,62 @@ from PalacePlayer import PalacePlayer
 
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Using device: {device}")
+
+# region Classes
+
+class PalaceExpertDataset(Dataset):
+    def __init__(self, data_dir="ground_truth_logs", seq_len=12):
+        self.samples = []
+        self.seq_len = seq_len
+        
+        # Find all saved game files
+        files = glob.glob(os.path.join(data_dir, "*.npz"))
+        
+        for f in files:
+            with np.load(f) as data:
+                statics = data['static']  # Shape: (GameSteps, Obs_Dim)
+                hists = data['hist']      # Shape: (GameSteps, Hist_Dim)
+                actions = data['actions']  # Shape: (GameSteps,)
+                corrections = data.get('is_human_correction', np.zeros_like(actions))  # Shape: (GameSteps,)
+                
+                # Create sliding windows of size 'seq_len'
+                # We need at least 'seq_len' steps to form a full input
+                for i in range(len(actions)):
+                    # If game is shorter than seq_len, we pad with zeros
+                    start_idx = max(0, i - self.seq_len + 1)
+                    
+                    s_window = statics[start_idx : i + 1]
+                    h_window = hists[start_idx : i + 1]
+                    target_action = actions[i]
+                    
+                    # Pad if the window is too small
+                    if len(s_window) < self.seq_len:
+                        print(s_window.shape, h_window.shape)
+
+                        pad_amt = self.seq_len - len(s_window)
+                        s_window = np.pad(s_window[0], ((pad_amt, 0), (0, 0)), mode='constant')
+                        h_window = np.pad(h_window[0], ((pad_amt, 0), (0, 0)), mode='constant')
+                    
+                    self.samples.append({
+                        'static': s_window.astype(np.float32),
+                        'hist': h_window.astype(np.float32),
+                        'action': int(target_action),
+                        'is_human_correction': bool(corrections[i])
+                    })
+                    
+        print(f"Loaded {len(self.samples)} training sequences from {len(files)} games.")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        return (
+            torch.from_numpy(sample['static']),
+            torch.from_numpy(sample['hist']),
+            torch.tensor(sample['action'], dtype=torch.long),
+            torch.tensor(sample['is_human_correction'], dtype=torch.bool)
+        )
 
 # region Functions
 
@@ -601,226 +659,227 @@ def sweep_train():
 #         p.join()
 
 
-# training length
-num_generations = 1000
-batch_size = 1024
+if __name__ == "__main__":
+    # training length
+    num_generations = 1000
+    batch_size = 1024
 
-# learning rate
-initial_lr = 1e-3
-final_lr = 1e-4
+    # learning rate
+    initial_lr = 1e-3
+    final_lr = 1e-4
 
-# entropy coefficient parameters
-initial_ent = 0.1
-final_ent = 0.0005
+    # entropy coefficient parameters
+    initial_ent = 0.1
+    final_ent = 0.0005
 
-# weightd decay
-weight_decay = 1e-5
+    # weightd decay
+    weight_decay = 1e-5
 
-last_king_loss = 0.0
+    last_king_loss = 0.0
 
-# player parameters
-sequence_length = 3 # starting number of actions to track in history
-sequence_length_inc = 3 # increase history length every N generations
-sequence_length_inc_interval = 200 # increase history length every N generations
+    # player parameters
+    sequence_length = 3 # starting number of actions to track in history
+    sequence_length_inc = 3 # increase history length every N generations
+    sequence_length_inc_interval = 200 # increase history length every N generations
 
-# initialize shared player
-shared_player = PalacePlayer().to(device)
-shared_player.apply(init_weights)
-players = [shared_player for _ in range(3)]
+    # initialize shared player
+    shared_player = PalacePlayer().to(device)
+    shared_player.apply(init_weights)
+    players = [shared_player for _ in range(3)]
 
-# separate parameters for weight decay
-decay_params = []
-non_decay_params = []
-no_decay_names = ['bias', 'norm', 'layer_norm', 'ln', 'bn']
-for name, param in shared_player.named_parameters():
-    if any(nd in name.lower() for nd in no_decay_names) or param.ndim == 1:
-        non_decay_params.append(param)
-    else:
-        decay_params.append(param)
+    # separate parameters for weight decay
+    decay_params = []
+    non_decay_params = []
+    no_decay_names = ['bias', 'norm', 'layer_norm', 'ln', 'bn']
+    for name, param in shared_player.named_parameters():
+        if any(nd in name.lower() for nd in no_decay_names) or param.ndim == 1:
+            non_decay_params.append(param)
+        else:
+            decay_params.append(param)
 
-# optimizer
-optimizer = torch.optim.AdamW([
-    {'params': decay_params, 'weight_decay': weight_decay},
-    {'params': non_decay_params, 'weight_decay': 0.0}
-], lr=initial_lr)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=200, T_mult=2, eta_min=final_lr)
+    # optimizer
+    optimizer = torch.optim.AdamW([
+        {'params': decay_params, 'weight_decay': weight_decay},
+        {'params': non_decay_params, 'weight_decay': 0.0}
+    ], lr=initial_lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=200, T_mult=2, eta_min=final_lr)
 
-# level tracking
-level_wins = torch.zeros(4, device = device)
-level_counts = torch.zeros(4, device = device)
-current_level_probs = [0.0, 0.0, 0.0, 1.0] # start all at level 3
+    # level tracking
+    level_wins = torch.zeros(4, device = device)
+    level_counts = torch.zeros(4, device = device)
+    current_level_probs = [0.0, 0.0, 0.0, 1.0] # start all at level 3
 
-# misc. parameter initializations
-best_player_weights = None
-delta_smoothed_loss = None
-patience = 50
-best_patience_criterion = 1.0 
-patience_counter = 0
-min_delta = 0.001
-# endregion
+    # misc. parameter initializations
+    best_player_weights = None
+    delta_smoothed_loss = None
+    patience = 50
+    best_patience_criterion = 1.0 
+    patience_counter = 0
+    min_delta = 0.001
+    # endregion
 
-# region WANDB Initialization
-wandb.init(
-    project="palace-ai",
-    name="vectorized-training-run",
-    config={
-        "num_generations": num_generations,
-        "batch_size": batch_size,
-        "initial_lr": initial_lr,
-        "final_lr": final_lr,
-        "entropy_start": initial_ent,
-        "entropy_end": final_ent,
-        "sequence_length": sequence_length,
-    }
-)
+    # region WANDB Initialization
+    wandb.init(
+        project="palace-ai",
+        name="vectorized-training-run",
+        config={
+            "num_generations": num_generations,
+            "batch_size": batch_size,
+            "initial_lr": initial_lr,
+            "final_lr": final_lr,
+            "entropy_start": initial_ent,
+            "entropy_end": final_ent,
+            "sequence_length": sequence_length,
+        }
+    )
 
-wandb.watch(shared_player, log="all", log_freq=20)
-# endregion
+    wandb.watch(shared_player, log="all", log_freq=20)
+    # endregion
 
-try:
-    
-    for generation in range(num_generations):
-        start_time = time.perf_counter()
+    try:
+        
+        for generation in range(num_generations):
+            start_time = time.perf_counter()
 
-        pool = NSAutoreleasePool.alloc().init()
-        try:
+            pool = NSAutoreleasePool.alloc().init()
+            try:
 
-            # Prepare players for this generation
-            b_lp, b_rew, b_ent, player_counters, stalemate_rate, level_wins, level_counts, king_win_rate, learner_win_rate = training_step(players, best_player_weights, batch_size, sequence_length, level_wins, level_counts, current_level_probs)
-            mean_turns = player_counters.sum(dim=0).float().mean().item()
-            patience_criterion = (stalemate_rate + mean_turns / 300.0) / 2.0
+                # Prepare players for this generation
+                b_lp, b_rew, b_ent, player_counters, stalemate_rate, level_wins, level_counts, king_win_rate, learner_win_rate = training_step(players, best_player_weights, batch_size, sequence_length, level_wins, level_counts, current_level_probs)
+                mean_turns = player_counters.sum(dim=0).float().mean().item()
+                patience_criterion = (stalemate_rate + mean_turns / 300.0) / 2.0
 
-            # Update level distribution based on performance
-            current_level_probs = update_level_distribution(level_wins.cpu().numpy(), level_counts.cpu().numpy(), current_level_probs)
+                # Update level distribution based on performance
+                current_level_probs = update_level_distribution(level_wins.cpu().numpy(), level_counts.cpu().numpy(), current_level_probs)
 
-            # adapt entropy coefficient according to learning rate schedule
-            current_ent_coef = get_dynamic_entropy(generation, start_ent=initial_ent, end_ent=final_ent)
+                # adapt entropy coefficient according to learning rate schedule
+                current_ent_coef = get_dynamic_entropy(generation, start_ent=initial_ent, end_ent=final_ent)
 
-            # increase sequence length at intervals
-            if (generation > 0 and generation % sequence_length_inc_interval == 0):
-                sequence_length += sequence_length_inc
-                print(f"[GEN {generation}] Increasing sequence length to {sequence_length}")
+                # increase sequence length at intervals
+                if (generation > 0 and generation % sequence_length_inc_interval == 0):
+                    sequence_length += sequence_length_inc
+                    print(f"[GEN {generation}] Increasing sequence length to {sequence_length}")
 
-            total_norm = torch.nn.utils.clip_grad_norm_(shared_player.parameters(), max_norm=0.5).detach().cpu().item()
-            rnn_norm = sum(p.grad.detach().data.norm(2).item() ** 2 for p in shared_player.rnn.parameters() if p.grad is not None) ** 0.5
+                total_norm = torch.nn.utils.clip_grad_norm_(shared_player.parameters(), max_norm=0.5).detach().cpu().item()
+                rnn_norm = sum(p.grad.detach().data.norm(2).item() ** 2 for p in shared_player.rnn.parameters() if p.grad is not None) ** 0.5
 
-            # Update using the accumulated batch data
-            total_loss = finish_batch_update(
-                optimizer, 
-                players,
-                b_lp, b_ent, b_rew, player_counters,
-                ent_coef=current_ent_coef, 
-                king_available=(best_player_weights is not None)
-            )           
+                # Update using the accumulated batch data
+                total_loss = finish_batch_update(
+                    optimizer, 
+                    players,
+                    b_lp, b_ent, b_rew, player_counters,
+                    ent_coef=current_ent_coef, 
+                    king_available=(best_player_weights is not None)
+                )           
 
-            # 1. Prepare level distribution for logging
-            # W&B can log dictionaries directly, making it easy to compare level behaviors
-            level_dist_dict = {f"level_{i}": prob for i, prob in enumerate(current_level_probs)}
+                # 1. Prepare level distribution for logging
+                # W&B can log dictionaries directly, making it easy to compare level behaviors
+                level_dist_dict = {f"level_{i}": prob for i, prob in enumerate(current_level_probs)}
 
-            # early exit logic, engage after king is chosen
-            if generation > 25:
-                if patience_criterion < (best_patience_criterion - min_delta):
-                    best_patience_criterion = patience_criterion
+                # early exit logic, engage after king is chosen
+                if generation > 25:
+                    if patience_criterion < (best_patience_criterion - min_delta):
+                        best_patience_criterion = patience_criterion
+                        patience_counter = 0
+                    else:
+                        patience_counter += 1
+
+            finally:
+                # force the macOS driver to release memory created by LSTM
+                del pool
+                if device.type == 'mps':
+                    torch.mps.empty_cache() # Clears Metal's internal buffers
+                gc.collect()
+
+            # region Player Evaluation
+            if generation % 5 == 0 and generation >= 25:
+                
+                num_games = 1024
+                loss_history = evaluate_players(players, num_games=num_games, sequence_length=sequence_length)
+                loss_rates = [l / num_games for l in loss_history]
+                king_loss_rate = loss_rates[0]
+                best_challenger_idx = np.argmin(loss_history[1:]) + 1
+                best_challenger_loss_rate = loss_rates[best_challenger_idx]
+                
+                # if the king is performing poorly AND someone is better, switch
+                if king_loss_rate > 0.40 and best_challenger_loss_rate < king_loss_rate: 
+                    reason = f"King underperformed significantly. {king_loss_rate:.2f} > 0.40 AND {best_challenger_loss_rate:.2f} < {king_loss_rate:.2f}"
+                    new_king_idx = best_challenger_idx
                     patience_counter = 0
+                
+                # if the king is okay, but a challenger is noticeably better (2% buffer)
+                elif (king_loss_rate - best_challenger_loss_rate) > 0.02:
+                    reason = f"Challenger outperformed king. {king_loss_rate:.2f} - {best_challenger_loss_rate:.2f} > 0.02"
+                    new_king_idx = best_challenger_idx
+                    patience_counter = 0
+                
                 else:
-                    patience_counter += 1
+                    reason = "King retains throne."
+                    new_king_idx = 0  # King stays
 
-        finally:
-            # force the macOS driver to release memory created by LSTM
-            del pool
-            if device.type == 'mps':
-                torch.mps.empty_cache() # Clears Metal's internal buffers
-            gc.collect()
+                if new_king_idx != 0:
+                    print(f"New King: Player {new_king_idx} ({reason})")
+                    best_player_weights = copy.deepcopy(players[new_king_idx].state_dict())
+                    save_best_player(players[new_king_idx], filename='temporary_king.pth')
+                elif new_king_idx == 0 and best_player_weights is None:
+                    # First time assigning king
+                    best_player_weights = copy.deepcopy(players[0].state_dict())
+                    save_best_player(players[0], filename='temporary_king.pth')
+                
+                print(f"Loss history: {loss_history}")       
+                # endregion
 
-        # region Player Evaluation
-        if generation % 5 == 0 and generation >= 25:
-            
-            num_games = 1024
-            loss_history = evaluate_players(players, num_games=num_games, sequence_length=sequence_length)
-            loss_rates = [l / num_games for l in loss_history]
-            king_loss_rate = loss_rates[0]
-            best_challenger_idx = np.argmin(loss_history[1:]) + 1
-            best_challenger_loss_rate = loss_rates[best_challenger_idx]
-            
-            # if the king is performing poorly AND someone is better, switch
-            if king_loss_rate > 0.40 and best_challenger_loss_rate < king_loss_rate: 
-                reason = f"King underperformed significantly. {king_loss_rate:.2f} > 0.40 AND {best_challenger_loss_rate:.2f} < {king_loss_rate:.2f}"
-                new_king_idx = best_challenger_idx
-                patience_counter = 0
-            
-            # if the king is okay, but a challenger is noticeably better (2% buffer)
-            elif (king_loss_rate - best_challenger_loss_rate) > 0.02:
-                reason = f"Challenger outperformed king. {king_loss_rate:.2f} - {best_challenger_loss_rate:.2f} > 0.02"
-                new_king_idx = best_challenger_idx
-                patience_counter = 0
-            
-            else:
-                reason = "King retains throne."
-                new_king_idx = 0  # King stays
+            if patience_counter >= patience:
+                wandb.log({"meta/early_stopped": True})
+                print(f"Early stopping at generation {generation} due to lack of improvement.")
+                break
 
-            if new_king_idx != 0:
-                print(f"New King: Player {new_king_idx} ({reason})")
-                best_player_weights = copy.deepcopy(players[new_king_idx].state_dict())
-                save_best_player(players[new_king_idx], filename='temporary_king.pth')
-            elif new_king_idx == 0 and best_player_weights is None:
-                # First time assigning king
-                best_player_weights = copy.deepcopy(players[0].state_dict())
-                save_best_player(players[0], filename='temporary_king.pth')
-            
-            print(f"Loss history: {loss_history}")       
-            # endregion
+            end_time = time.perf_counter()
+            time_taken = end_time - start_time
 
-        if patience_counter >= patience:
-            wandb.log({"meta/early_stopped": True})
-            print(f"Early stopping at generation {generation} due to lack of improvement.")
-            break
+            # 2. Log to Weights & Biases
+            wandb.log({
+                # Gradient Norms
+                "grads/total_norm": total_norm,
+                "grads/rnn_norm": rnn_norm,
 
-        end_time = time.perf_counter()
-        time_taken = end_time - start_time
+                # Policy Values
+                "policy/mean_entropy": b_ent.mean().detach().cpu().item(),
+                "policy/max_prob_avg": torch.exp(b_lp[b_lp != 0]).mean().detach().cpu().item(),
+                "policy/mean_reward": b_rew.mean().detach().cpu().item(),
+                
+                # Training Dynamics
+                "train/loss": total_loss,
+                "train/learning_rate": scheduler.get_last_lr()[0],
+                "train/entropy_coefficient": current_ent_coef,
+                
+                # Game Performance
+                "game/stalemate_rate": stalemate_rate,
+                "game/mean_turns_taken": mean_turns,
+                "game/king_win_rate": king_win_rate,
+                "game/learner_win_rate": learner_win_rate,
 
-        # 2. Log to Weights & Biases
-        wandb.log({
-            # Gradient Norms
-            "grads/total_norm": total_norm,
-            "grads/rnn_norm": rnn_norm,
+                # Patience Criterion
+                "meta/patience_criterion": patience_criterion,
 
-            # Policy Values
-            "policy/mean_entropy": b_ent.mean().detach().cpu().item(),
-            "policy/max_prob_avg": torch.exp(b_lp[b_lp != 0]).mean().detach().cpu().item(),
-            "policy/mean_reward": b_rew.mean().detach().cpu().item(),
-            
-            # Training Dynamics
-            "train/loss": total_loss,
-            "train/learning_rate": scheduler.get_last_lr()[0],
-            "train/entropy_coefficient": current_ent_coef,
-            
-            # Game Performance
-            "game/stalemate_rate": stalemate_rate,
-            "game/mean_turns_taken": mean_turns,
-            "game/king_win_rate": king_win_rate,
-            "game/learner_win_rate": learner_win_rate,
+                # Performance Timing
+                "performance/step_duration": time_taken,
+                
+                # Optional: Log the relationship (Global exploration health)
+                "meta/ent_lr_ratio": current_ent_coef / (scheduler.get_last_lr()[0] + 1e-8)
+            })
 
-            # Patience Criterion
-            "meta/patience_criterion": patience_criterion,
+            # step the scheduler
+            scheduler.step()
 
-            # Performance Timing
-            "performance/step_duration": time_taken,
-            
-            # Optional: Log the relationship (Global exploration health)
-            "meta/ent_lr_ratio": current_ent_coef / (scheduler.get_last_lr()[0] + 1e-8)
-        })
+        save_best_player(players[0], filename='temporary_king.pth')
 
-        # step the scheduler
-        scheduler.step()
-
-    save_best_player(players[0], filename='temporary_king.pth')
-
-except KeyboardInterrupt:
-    print("\n[INTERRUPT] Training paused by user. Saving current models...")
-    
-    # Save the Learner (current weights being optimized)
-    torch.save(players[1].state_dict(), "learner_interrupted.pt")
-    
-    # Save the King (the current best performer)
-    save_best_player(players[0], filename='temporary_king.pth')
-    print("Models saved successfully. Exiting.")
+    except KeyboardInterrupt:
+        print("\n[INTERRUPT] Training paused by user. Saving current models...")
+        
+        # Save the Learner (current weights being optimized)
+        torch.save(players[1].state_dict(), "learner_interrupted.pt")
+        
+        # Save the King (the current best performer)
+        save_best_player(players[0], filename='temporary_king.pth')
+        print("Models saved successfully. Exiting.")

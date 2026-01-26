@@ -4,8 +4,10 @@ import shap
 
 # Run this once in your analysis environment
 input_rec, action_rec, _, _ = play_game("Palace_king.pth")
+print("Input record shape:", input_rec.shape)
+print("Action record shape:", action_rec.shape)
 num_turns = input_rec.shape[0]
-action_dim, seq_len = 79, 6
+action_dim, seq_len = 79, 12
 
 # Flatten and combine
 flattened_action_history = action_rec.reshape(num_turns, seq_len * action_dim)

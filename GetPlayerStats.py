@@ -41,7 +41,7 @@ def create_static_input_vector(env):
 
     return torch.cat(parts, dim = 1).float()  # (B, 73)
 
-def play_game(king_path, device="mps"):
+def play_game(king_path, seq_len = 12,device="mps"):
     batch_size = 1
     env = PalaceEnv(batch_size=batch_size, num_players=3, device=device)
     
@@ -49,7 +49,7 @@ def play_game(king_path, device="mps"):
     king_model.load_state_dict(torch.load(king_path, map_location=device))
     king_model.eval()
 
-    action_history = torch.zeros((batch_size, 6, 79), device=device)
+    action_history = torch.zeros((batch_size, seq_len, 79), device=device)
     hidden_states = {
         p: (torch.zeros(2, batch_size, king_model.hidden_dim, device=device),
             torch.zeros(2, batch_size, king_model.hidden_dim, device=device))
@@ -127,10 +127,10 @@ def analyze_game_dominance(king_path, input_record, action_record, acting_player
         
         # first 6 * 79 = 474 are action history
         action_dim = 79
-        seq_len = 6
-        action_history_flat = X[:, :seq_len * action_dim] # (B, 474)
+        seq_len = 12
+        action_history_flat = X[:, :seq_len * action_dim] # (B, seq_len * action_dim)
         static_obs = X[:, seq_len * action_dim:] # (B, 82)
-        action_history = action_history_flat.view(batch_size, seq_len, action_dim) # (B, 6, 79)
+        action_history = action_history_flat.view(batch_size, seq_len, action_dim) # (B, seq_len, 79)
 
         # initialize hidden states to zero
         h0 = torch.zeros(king_model.num_rnn_layers, batch_size, king_model.hidden_dim, device=device)
@@ -145,7 +145,7 @@ def analyze_game_dominance(king_path, input_record, action_record, acting_player
     # Flatten input_record and action_record for SHAP
     num_turns = input_record.shape[0]
     action_dim = 79
-    seq_len = 6
+    seq_len = 12
     flattened_action_history = action_record.reshape(num_turns, seq_len * action_dim)
     flattened_input = np.hstack((flattened_action_history, input_record))  # (num_turns, 474 + 82)
 
@@ -163,7 +163,7 @@ def plot_decision_component(shap_values, action_idx_record, action_record, actin
 
     num_turns = shap_values.values.shape[0]
     action_dim = 79
-    seq_len = 6
+    seq_len = 12
     num_features = shap_values.values.shape[1]
     shap_impact_on_chosen = np.zeros((num_turns, num_features))
     for t in range(num_turns):
@@ -369,7 +369,7 @@ def save_explanation_file(shap_values, input_record, action_idx_record, acting_p
     document_string = ""
     num_turns = shap_values.values.shape[0]
     action_dim = 79
-    seq_len = 6
+    seq_len = 12
     for t in range(num_turns):
         action_idx = np.argmax(shap_values.values[t].sum(axis=0))
         document_string += f"{t + 1}. {labels[action_idx_record[t]]} because: "

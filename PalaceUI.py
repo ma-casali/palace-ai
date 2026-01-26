@@ -6,6 +6,7 @@ import os
 import datetime
 from VectorizedCardGame import PalaceEnv
 from PalacePlayer import PalacePlayer
+from VectorizedTraining import PalaceExpertDataset 
 
 SCREEN_WIDTH, SCREEN_HEIGHT = 1200, 800
 CARD_WIDTH, CARD_HEIGHT = 70, 100
@@ -56,13 +57,14 @@ class PalaceExplainer:
         # expand flattened data back to original shape
         X = torch.tensor(data, dtype=torch.float32, device = self.device)
         batch_size = X.shape[0]
+        print(X.shape)
         
         # first 6 * 79 = 474 are action history
         action_dim = 79
-        seq_len = 6
-        action_history_flat = X[:, :seq_len * action_dim] # (B, 474)
+        seq_len = 12
+        action_history_flat = X[:, :seq_len * action_dim] # (B, seq_len * action_dim)
         static_obs = X[:, seq_len * action_dim:] # (B, 82)
-        action_history = action_history_flat.view(batch_size, seq_len, action_dim) # (B, 6, 79)
+        action_history = action_history_flat.view(batch_size, seq_len, action_dim) # (B, 12, 79)
 
         # initialize hidden states to zero
         h0 = torch.zeros(self.model.num_rnn_layers, batch_size, self.model.hidden_dim, device=self.device)
@@ -87,7 +89,7 @@ class PalaceExplainer:
     def get_turn_explanation(self, history, static, action_idx, current_player):
         card_names = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"]
         action_dim = 79
-        seq_len = 6
+        seq_len = 12
         
         # 1. Generate Action Labels
         labels = []
@@ -195,7 +197,7 @@ class PalaceUI:
         self.logger = GroundTruthLogger()
 
         # rnn state tracking
-        self.action_history = torch.zeros((1, 6, 79)).to(device)
+        self.action_history = torch.zeros((1, 12, 79)).to(device)
         self.hidden_states = {
             p: (torch.zeros(self.king_model.num_rnn_layers, 1, self.king_model.hidden_dim).to(device),
                 torch.zeros(self.king_model.num_rnn_layers, 1, self.king_model.hidden_dim).to(device))
@@ -823,3 +825,13 @@ def run_game(king_path):
 
 if __name__ == "__main__":
     run_game('Palace_king.pth')
+
+    # test to make sure data was saved correctly
+    logger = PalaceExpertDataset()
+    print(f"Logged {logger.__len__()} expert steps.")
+    print("Sample step data:")
+    sample_obs, sample_history, sample_action, sample_corrected = logger.__getitem__(0)
+    print("Static Obs:", sample_obs)
+    print("Action History:", sample_history)
+    print("Action Taken:", sample_action)
+    print("Corrected by Human:", sample_corrected)

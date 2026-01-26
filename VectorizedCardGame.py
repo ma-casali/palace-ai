@@ -184,7 +184,8 @@ class PalaceEnv:
         cfg = REWARD_CONFIG
         rewards = torch.zeros((self.batch_size, self.num_players), device = self.device)
         penalty = cfg['step_penalty'] * (1.0 + self.turn_counts.float() / 100.0)
-        rewards += penalty.unsqueeze(1)
+        players_still_in_game = (self.finish_times == 0)
+        rewards = torch.where(players_still_in_game, rewards + penalty.unsqueeze(1), rewards)
         batch_ids = torch.arange(self.batch_size, device=self.device)
         active_hand_sizes = (
             self.hands[batch_ids, self.active_players].sum(dim=1) + 
@@ -258,7 +259,6 @@ class PalaceEnv:
                 self.run_ranks[fail_batch_ids] = -1
                 self.run_count[fail_batch_ids] = 0
                 
-
             success_batch_ids = facedown_batch_inds[~is_fail]
             if success_batch_ids.numel() > 0:
                 is_ten = (chosen_ranks[~is_fail] == 8)
@@ -373,13 +373,14 @@ class PalaceEnv:
 
         # region UPDATE DISCARD PILE COUNTS AND TOP CARDS
         # add cards to discard piles, unless 10 (clear) or pickup
-        not_pickup = (actions != 78)
-        self.discard_counts.scatter_add_(
-            1,
-            card_ranks.unsqueeze(1),
-            (num_cards_played * not_pickup).unsqueeze(1).to(self.discard_counts.dtype)
-        )
-        self.top_cards = torch.where(not_pickup, card_ranks, torch.tensor(-1, device=self.device))
+        standard_play_mask = (actions < 65) 
+        if standard_play_mask.any():
+            self.discard_counts.scatter_add_(
+                1,
+                card_ranks[standard_play_mask].unsqueeze(1),
+                num_cards_played[standard_play_mask].unsqueeze(1).to(self.discard_counts.dtype)
+            )
+            self.top_cards[standard_play_mask] = card_ranks[standard_play_mask]
         # endregion
 
         # region ROTATE TO NEXT PLAYER

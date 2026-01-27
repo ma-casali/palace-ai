@@ -89,5 +89,6 @@ if __name__ == "__main__":
         export_params=True,
         opset_version=12,
         input_names=['action_history', 'static_features', 'mask'],
-        output_names=['probs', 'hidden_state']
+        output_names=['probs', 'hidden_state'],
+        dynamo = True
     )

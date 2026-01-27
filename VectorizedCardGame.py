@@ -50,6 +50,7 @@ class PalaceEnv:
         self.hands = torch.zeros((batch_size, num_players, 13), dtype=torch.float32, device=device)
         self.face_up_piles = torch.zeros((batch_size, num_players, 13), dtype=torch.long, device=device)
         self.face_down_piles = torch.zeros((batch_size, num_players, 13), dtype=torch.long, device=device)
+        self.chosen_ranks = -1*torch.ones(batch_size, dtype=torch.long, device=self.device) # for facedown tracking
 
         # other piles (1, batch_size)
         self.discard_counts = torch.zeros((batch_size, 13), dtype=torch.float32, device=device)
@@ -80,6 +81,7 @@ class PalaceEnv:
         self.top_cards.fill_(-1)
         self.run_ranks.fill_(-1)
         self.run_count.fill_(0)
+        self.chosen_ranks.fill_(-1)
         self.active_players.fill_(0)
         self.finish_times.fill_(0)
         self.done.fill_(False)
@@ -194,12 +196,12 @@ class PalaceEnv:
         )
         rewards[batch_ids, self.active_players] += cfg['hand_size_penalty'] * active_hand_sizes
 
-        self.chosen_ranks = -1*torch.ones(self.batch_size, dtype=torch.long, device=self.device) # for facedown tracking
         card_ranks = actions % 13
         action_categories = actions // 13
 
         # region FACEDOWN LOGIC
         facedown_mask = (actions // 13 == 5) & (self.face_down_piles[batch_ids, self.active_players].sum(dim = 1) > 0)
+        is_facedown_fail = torch.zeros(self.batch_size, dtype=torch.bool, device=self.device)
         if facedown_mask.any():
             rewards[facedown_mask, self.active_players[facedown_mask]] += cfg['facedown_milestone_bonus']
             facedown_player_ids = self.active_players[facedown_mask]
@@ -213,13 +215,13 @@ class PalaceEnv:
             fail_7 = (top_discard == 5) & (card_ranks[facedown_mask] >= 6) & (~is_wild)
             fail_3 = (top_discard == 1) & (card_ranks[facedown_mask] != 1)
             fail_normal = (top_discard != 5) & (top_discard != -1) & (card_ranks[facedown_mask] < top_discard) & (~is_wild)
-            is_fail = fail_7 | fail_normal | fail_3
+            is_facedown_fail = fail_7 | fail_normal | fail_3
 
             facedown_batch_inds = batch_ids[facedown_mask]
             
-            fail_batch_ids = facedown_batch_inds[is_fail]
+            fail_batch_ids = facedown_batch_inds[is_facedown_fail]
             if fail_batch_ids.numel() > 0:
-                self.hands[fail_batch_ids, self.active_players[fail_batch_ids], card_ranks[facedown_mask][is_fail]] += 1
+                self.hands[fail_batch_ids, self.active_players[fail_batch_ids], card_ranks[facedown_mask][is_facedown_fail]] += 1
                 rewards[fail_batch_ids, self.active_players[fail_batch_ids]] += cfg['pickup_base_penalty'] + cfg['pickup_per_card_penalty'] * self.discard_counts[fail_batch_ids].sum(dim=1)
 
                 self.discard_counts[fail_batch_ids, 1] = 0 # make sure no one picks up a three
@@ -365,7 +367,7 @@ class PalaceEnv:
 
         # region UPDATE DISCARD PILE COUNTS AND TOP CARDS
         # add cards to discard piles, unless 10 (clear) or pickup
-        standard_play_mask = (actions < 78) 
+        standard_play_mask = (actions < 78) & ~is_facedown_fail
         if standard_play_mask.any():
             self.discard_counts.scatter_add_(
                 1,

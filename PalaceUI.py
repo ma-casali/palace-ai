@@ -14,7 +14,7 @@ SCREEN_WIDTH, SCREEN_HEIGHT = 1280, 720
 CARD_WIDTH, CARD_HEIGHT = 70, 100
 OVERLAP_SPACING = 30
 SPACING = 75
-FPS = 60
+FPS = 120
 
 class GroundTruthLogger:
     def __init__(self, save_dir="ground_truth_logs"):
@@ -229,6 +229,7 @@ class PalaceUI:
 
         # animations
         self.animations = []
+        self.last_discard = self.env.top_cards[0].item()
 
         # player positions on table
         self.player_positions = {
@@ -439,9 +440,8 @@ class PalaceUI:
                 return 52 + self.selected_faceup_indices[0]  # Action index for faceup cards
             return 78
         
-        
         if self.selected_facedown_indices:
-            remaining_cards = torch.where(self.env.face_down_piles[0, 0] == 1)[0]
+            remaining_cards = torch.where(self.env.face_down_piles[0, 0] >= 1)[0]
             if remaining_cards.numel() > 0:
                 return remaining_cards[0].item() + 65 # play the first, because it's randomized anyway
             else:
@@ -523,14 +523,23 @@ class PalaceUI:
         return hand_list
     
     # region RENDER
-    def render_game(self, suggested_action = None, confidence = None):
+    def render_game(self, suggested_action = None, confidence = None, action_taken = None):
         self.screen.fill(self.GREEN)  # Green background
         self.clickable_hand = {}
         self.clickable_faceup = {}
         self.clickable_facedown = {}
 
         # Draw Top Card & Pile
-        top_card = self.env.top_cards[0].item()
+        # draw whatever card should be shown before an animation is played
+        if self.animations:
+            top_card = self.last_discard
+        elif not self.animations:
+            top_card = self.env.top_cards[0].item()
+            self.last_discard = self.env.top_cards[0].item()
+        elif (action_taken == 78 and self.animations):
+            top_card = -1
+            self.last_discard = self.env.top_cards[0].item()
+
         if top_card >= 0:
             if suggested_action is not None and suggested_action == 78:
                 glow_rect = self.pile_rect.inflate(8, 8)
@@ -761,11 +770,31 @@ def run_game(king_path):
                                             card_surf = ui.get_card_surface( ui.env.chosen_ranks[0].item() )
                                             ui.animate_card_move( card_surf, start_pos, end_pos, duration = 50 )
 
-                                            while ui.animations:
-                                                ui.clock.tick(FPS)
-                                                ui.render_game(suggested_action, confidence)
-                                                ui.run_animations()
-                                                pygame.display.flip()
+                                        elif action_taken < 52: # from hand play
+                                            rank = action_taken % 13
+
+                                            start_pos = (ui.player_positions[current_player][0] + CARD_WIDTH + 5 - (CARD_WIDTH + 5) * 3 // 2,
+                                                            ui.player_positions[current_player][1] - CARD_HEIGHT - 20)
+                                            end_pos = ui.pile_rect.topleft 
+                                            card_surf = ui.get_card_surface(rank)
+
+                                            ui.animate_card_move( card_surf, start_pos, end_pos)
+                                        
+                                        elif action_taken < 65 and action_taken >= 52: # faceup play
+                                            rank = action_taken - 52
+
+                                            start_pos = (ui.player_positions[current_player][0] - (CARD_WIDTH + 5) * 3 // 2 + (CARD_WIDTH + 5),
+                                                            ui.player_positions[current_player][1] - 10)
+                                            end_pos = ui.pile_rect.topleft 
+                                            card_surf = ui.get_card_surface(rank)
+
+                                            ui.animate_card_move( card_surf, start_pos, end_pos)
+
+                                        while ui.animations:
+                                            ui.clock.tick(FPS)
+                                            ui.render_game(suggested_action, confidence, action_taken)
+                                            ui.run_animations()
+                                            pygame.display.flip()
 
                                         waiting = False
                                     else:
@@ -776,7 +805,7 @@ def run_game(king_path):
                 else:
                     # AI's turn
                     action_taken, _ = ui.get_ai_action(current_player)
-                    if action_taken < 52:
+                    if action_taken < 52: # from hand play
                         rank = action_taken % 13
 
                         start_pos = (ui.player_positions[current_player][0] + CARD_WIDTH + 5 - (CARD_WIDTH + 5) * 3 // 2,
@@ -786,7 +815,7 @@ def run_game(king_path):
 
                         ui.animate_card_move( card_surf, start_pos, end_pos)
                     
-                    elif action_taken < 65 and action_taken >= 52:
+                    elif action_taken < 65 and action_taken >= 52: # faceup play
                         rank = action_taken - 52
 
                         start_pos = (ui.player_positions[current_player][0] - (CARD_WIDTH + 5) * 3 // 2 + (CARD_WIDTH + 5),
@@ -796,17 +825,27 @@ def run_game(king_path):
 
                         ui.animate_card_move( card_surf, start_pos, end_pos)
 
-                    elif action_taken < 78 and action_taken >= 65:
-                        rank = action_taken - 65
-
-                        start_pos = (ui.player_positions[current_player][0] - (CARD_WIDTH + 5) * 3 // 2 +  (CARD_WIDTH + 5),
-                                        ui.player_positions[current_player][1])
-                        end_pos = ui.pile_rect.topleft 
-                        card_surf = ui.get_card_surface(rank)
-
+                    elif action_taken < 78 and action_taken >= 65: # facedown play
+                        player_rewards, _ = ui.env.step(torch.tensor([action_taken], device=device))
+                        player_reward += player_rewards[0, 0].item()
+                        ui.update_history(action_taken)
+                        ui.selected_hand_indices = []
+                        ui.selected_faceup_indices = []
+                        ui.selected_facedown_indices = False
+                        if ui.env.top_cards[0].item() >= 0:
+                            start_pos =  (ui.player_positions[current_player][0] - (CARD_WIDTH + 5) * 3 // 2 + (CARD_WIDTH + 5),
+                                            ui.player_positions[current_player][1])
+                            end_pos = ui.pile_rect.topleft
+                            card_surf = ui.get_card_surface( ui.env.chosen_ranks[0].item() )
+                        else:
+                            # pick up animation if the facedown card resulted in a pickup
+                            end_pos = (ui.player_positions[current_player][0] - (CARD_WIDTH + 5) - (CARD_WIDTH + 5) * 3 // 2,
+                                            ui.player_positions[current_player][1])
+                            start_pos = ui.pile_rect.topleft 
+                            card_surf = ui.get_card_surface( ui.last_discard )
                         ui.animate_card_move( card_surf, start_pos, end_pos)
 
-                    else:
+                    else: # pick up pile
                         start_pos = ui.pile_rect.topleft
                         end_pos = (ui.player_positions[current_player][0] + CARD_WIDTH + 5 - (CARD_WIDTH + 5) * 3 // 2,
                                         ui.player_positions[current_player][1] + CARD_HEIGHT + 20)
@@ -821,7 +860,7 @@ def run_game(king_path):
 
                 # Step the environment
                 if action_taken is not None :
-                    if not (current_player == 0 and action_taken >= 65 and action_taken < 78):
+                    if not (action_taken >= 65 and action_taken < 78):
                         player_rewards, _ = ui.env.step(torch.tensor([action_taken], device=device))
                         player_reward += player_rewards[0, 0].item()
                     ui.update_history(action_taken)

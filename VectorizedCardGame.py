@@ -194,8 +194,40 @@ class PalaceEnv:
         )
         rewards[batch_ids, self.active_players] += cfg['hand_size_penalty'] * active_hand_sizes
 
+        self.chosen_ranks = -1*torch.ones(self.batch_size, dtype=torch.long, device=self.device) # for facedown tracking
         card_ranks = actions % 13
         action_categories = actions // 13
+
+        # region FACEDOWN LOGIC
+        facedown_mask = (actions // 13 == 5) & (self.face_down_piles[batch_ids, self.active_players].sum(dim = 1) > 0)
+        if facedown_mask.any():
+            rewards[facedown_mask, self.active_players[facedown_mask]] += cfg['facedown_milestone_bonus']
+            facedown_player_ids = self.active_players[facedown_mask]
+            card_ranks[facedown_mask] = torch.multinomial(self.face_down_piles[facedown_mask, facedown_player_ids].float(), 1).squeeze(1)
+            self.chosen_ranks = card_ranks[facedown_mask]
+            self.face_down_piles[facedown_mask, self.active_players[facedown_mask], card_ranks[facedown_mask]] -= 1
+
+            # evaluate success/failure of the pull
+            top_discard = self.top_cards[facedown_mask] if (self.discard_counts[facedown_mask].sum() > 0) else -1
+            is_wild = (card_ranks[facedown_mask] == 0) | (card_ranks[facedown_mask] == 1) | (card_ranks[facedown_mask] == 5) | (card_ranks[facedown_mask] == 8)
+            fail_7 = (top_discard == 5) & (card_ranks[facedown_mask] >= 6) & (~is_wild)
+            fail_3 = (top_discard == 1) & (card_ranks[facedown_mask] != 1)
+            fail_normal = (top_discard != 5) & (top_discard != -1) & (card_ranks[facedown_mask] < top_discard) & (~is_wild)
+            is_fail = fail_7 | fail_normal | fail_3
+
+            facedown_batch_inds = batch_ids[facedown_mask]
+            
+            fail_batch_ids = facedown_batch_inds[is_fail]
+            if fail_batch_ids.numel() > 0:
+                self.hands[fail_batch_ids, self.active_players[fail_batch_ids], card_ranks[facedown_mask][is_fail]] += 1
+                rewards[fail_batch_ids, self.active_players[fail_batch_ids]] += cfg['pickup_base_penalty'] + cfg['pickup_per_card_penalty'] * self.discard_counts[fail_batch_ids].sum(dim=1)
+
+                self.discard_counts[fail_batch_ids, 1] = 0 # make sure no one picks up a three
+                self.hands[fail_batch_ids, self.active_players[fail_batch_ids]] += self.discard_counts[fail_batch_ids] # pick up on fail
+                self.discard_counts[fail_batch_ids] = torch.zeros_like(self.discard_counts[fail_batch_ids])
+                self.top_cards[fail_batch_ids] = -1
+                self.run_ranks[fail_batch_ids] = -1
+                self.run_count[fail_batch_ids] = 0
         
         # region PLAY FROM HAND OR FACE-UP LOGIC
         played_two   = (card_ranks == 0) & (actions < 78)
@@ -226,46 +258,6 @@ class PalaceEnv:
         self.hands[play_from_hand_mask, self.active_players[play_from_hand_mask], card_ranks[play_from_hand_mask]] -= action_categories[play_from_hand_mask] + 1
         self.face_up_piles[play_from_faceup_mask, self.active_players[play_from_faceup_mask], card_ranks[play_from_faceup_mask]] -= 1
         rewards[(actions >= 52) & (actions < 65), self.active_players[(actions >= 52) & (actions < 65)]] += cfg['faceup_milestone_bonus']
-        # endregion
-
-        # region FACEDOWN LOGIC
-        facedown_mask = (actions // 13 == 5) & (self.face_down_piles[batch_ids, self.active_players].sum(dim = 1) > 0)
-        if facedown_mask.any():
-            rewards[facedown_mask, self.active_players[facedown_mask]] += cfg['facedown_milestone_bonus']
-            facedown_player_ids = self.active_players[facedown_mask]
-            chosen_ranks = torch.multinomial(self.face_down_piles[facedown_mask, facedown_player_ids].float(), 1).squeeze(1)
-            self.chosen_ranks = chosen_ranks
-            self.face_down_piles[facedown_mask, self.active_players[facedown_mask], chosen_ranks] -= 1
-
-            # evaluate success/failure of the pull
-            top_discard = self.top_cards[facedown_mask] if (self.discard_counts[facedown_mask].sum() > 0) else -1
-            is_wild = (chosen_ranks == 0) | (chosen_ranks == 1) | (chosen_ranks == 5) | (chosen_ranks == 8)
-            fail_7 = (top_discard == 5) & (chosen_ranks >= 6) & (~is_wild)
-            fail_3 = (top_discard == 1) & (chosen_ranks != 1)
-            fail_normal = (top_discard != 5) & (top_discard != -1) & (chosen_ranks < top_discard) & (~is_wild)
-            is_fail = fail_7 | fail_normal | fail_3
-
-            facedown_batch_inds = batch_ids[facedown_mask]
-            
-            fail_batch_ids = facedown_batch_inds[is_fail]
-            if fail_batch_ids.numel() > 0:
-                self.hands[fail_batch_ids, self.active_players[fail_batch_ids], chosen_ranks[is_fail]] += 1
-                rewards[fail_batch_ids, self.active_players[fail_batch_ids]] += cfg['pickup_base_penalty'] + cfg['pickup_per_card_penalty'] * self.discard_counts[fail_batch_ids].sum(dim=1)
-
-                self.discard_counts[fail_batch_ids, 1] = 0 # make sure no one picks up a three
-                self.hands[fail_batch_ids, self.active_players[fail_batch_ids]] += self.discard_counts[fail_batch_ids] # pick up on fail
-                self.discard_counts[fail_batch_ids] = torch.zeros_like(self.discard_counts[fail_batch_ids])
-                self.top_cards[fail_batch_ids] = -1
-                self.run_ranks[fail_batch_ids] = -1
-                self.run_count[fail_batch_ids] = 0
-                
-            success_batch_ids = facedown_batch_inds[~is_fail]
-            if success_batch_ids.numel() > 0:
-                is_ten = (chosen_ranks[~is_fail] == 8)
-                self.discard_counts[success_batch_ids, chosen_ranks[~is_fail]] += 1
-                self.top_cards[success_batch_ids] = chosen_ranks[~is_fail]
-                rewards[success_batch_ids, self.active_players[success_batch_ids]] += cfg['card_played_base'] + cfg['per_card_bonus']
-
         # endregion
 
         # region PICKUP LOGIC 
@@ -373,7 +365,7 @@ class PalaceEnv:
 
         # region UPDATE DISCARD PILE COUNTS AND TOP CARDS
         # add cards to discard piles, unless 10 (clear) or pickup
-        standard_play_mask = (actions < 65) 
+        standard_play_mask = (actions < 78) 
         if standard_play_mask.any():
             self.discard_counts.scatter_add_(
                 1,
@@ -384,7 +376,7 @@ class PalaceEnv:
         # endregion
 
         # region ROTATE TO NEXT PLAYER
-        is_burn = (card_ranks == 8) | (self.run_count >= 4)
+        is_burn = (card_ranks == 8) | (self.run_count >= 4) 
         self.active_players = torch.where(is_burn, self.active_players, (self.active_players + 1) % self.num_players)
 
         # this for loop ensures that we skip over players who are already done,

@@ -2,13 +2,15 @@ import pygame
 import torch
 import numpy as np
 import shap
+import sys
 import os
 import datetime
 from VectorizedCardGame import PalaceEnv
 from PalacePlayer import PalacePlayer
-from VectorizedTraining import PalaceExpertDataset 
+from VectorizedTraining import PalaceHumanDataset 
+os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 
-SCREEN_WIDTH, SCREEN_HEIGHT = 1200, 800
+SCREEN_WIDTH, SCREEN_HEIGHT = 1280, 720
 CARD_WIDTH, CARD_HEIGHT = 70, 100
 OVERLAP_SPACING = 30
 SPACING = 75
@@ -30,7 +32,7 @@ class GroundTruthLogger:
             'is_human_correction': is_human_correction
         })
 
-    def save_game(self):
+    def save_game(self, is_loss):
         if not self.buffer: return
         
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -41,8 +43,9 @@ class GroundTruthLogger:
         hist_data = np.array([step['action_history'] for step in self.buffer])
         actions = np.array([step['action'] for step in self.buffer])
         human_corrections = np.array([step['is_human_correction'] for step in self.buffer])
+        is_loss = np.array([is_loss] * len(actions))
         
-        np.savez_compressed(filename, static=static_data, hist=hist_data, actions=actions, human_corrections=human_corrections)
+        np.savez_compressed(filename, static=static_data, hist=hist_data, actions=actions, human_corrections=human_corrections, is_loss=is_loss)
         print(f"Game saved with {len(self.buffer)} steps to {filename}")
         self.buffer = [] # Reset for next game
 
@@ -420,25 +423,31 @@ class PalaceUI:
     # region CONVERT_SELECTION_TO_ACTION
     def convert_selection_to_action(self):
 
-        remaining_cards = torch.where(self.env.face_down_piles[0, 0] == 1)[0]
-
         current_hand = self.get_flat_hand(self.env.hands[0, 0])
-        if len(current_hand) != 0 and self.selected_hand_indices:
-            selected_ranks = [current_hand[i] for i in self.selected_hand_indices]
-            rank = selected_ranks[0] # validation to make sure all selected cards are the same rank
-            if any(r != rank for r in selected_ranks): return None  # Invalid selection
-            return (len(selected_ranks) - 1) * 13 + rank  # Calculate action index for hand cards
-        
-        if len(current_hand) == 0 and self.selected_faceup_indices:
-            return 52 + self.selected_faceup_indices[0]  # Face-up card action index
-        
-        if remaining_cards.numel() == 0:
-            print("Warning: Tried to play facedown card, but none are left.")
+        if len(current_hand) > 0:
+            if self.selected_hand_indices:
+                selected_ranks = [current_hand[i] for i in self.selected_hand_indices]
+                rank = selected_ranks[0] # validation to make sure all selected cards are the same rank
+
+                if any(r != rank for r in selected_ranks): return None  # Invalid selection
+                return (len(selected_ranks) - 1) * 13 + rank  # Calculate action index for hand cards
             return 78
         
-        if len(current_hand) == 0 and self.env.face_up_piles[0, 0].sum().item() == 0 and self.selected_facedown_indices:
-            # make this a random choice among facedown cards
-            return torch.where(self.env.face_down_piles[0, 0] == 1)[0][0].item() + 65
+        faceup_count = self.env.face_up_piles[0, 0].sum().item()
+        if faceup_count > 0:
+            if self.selected_faceup_indices:
+                return 52 + self.selected_faceup_indices[0]  # Action index for faceup cards
+            return 78
+        
+        
+        if self.selected_facedown_indices:
+            remaining_cards = torch.where(self.env.face_down_piles[0, 0] == 1)[0]
+            if remaining_cards.numel() > 0:
+                return remaining_cards[0].item() + 65 # play the first, because it's randomized anyway
+            else:
+                print(self.env.face_down_piles)
+                print("Warning: Tried to play a facedown card but none are left.")
+                return 78
         
         return 78
 
@@ -552,10 +561,12 @@ class PalaceUI:
             for j in range(facedown_count):
                 x = self.player_positions[player_idx][0] - (CARD_WIDTH + 5) * 3 // 2 + j * (CARD_WIDTH + 5)
                 y = self.player_positions[player_idx][1]
-                pygame.draw.rect(self.screen, (0, 0, 139), (x, y, CARD_WIDTH, CARD_HEIGHT))  # Dark blue back of card
                 if player_idx == 0 and self.env.hands[0, 0].sum().item() == 0 and self.env.face_up_piles[0, 0].sum().item() == 0:
+                    is_selected = (self.selected_facedown_indices)
+                    y -= 20 if is_selected else 0
                     rect = pygame.Rect(x, y, CARD_WIDTH, CARD_HEIGHT)
                     self.clickable_facedown[tuple(rect)] = {'id': j, 'rank': -1} 
+                pygame.draw.rect(self.screen, (0, 0, 139), (x, y, CARD_WIDTH, CARD_HEIGHT))  # Dark blue back of card
 
         # Draw Face-Up Cards, for opponents then player
         for i, player_idx in enumerate(range(3)):
@@ -819,19 +830,21 @@ def run_game(king_path):
                     ui.selected_facedown_indices = False
 
             print(f"Game Over! Your Reward: {player_reward:.2f}")
-            ui.logger.save_game()
+            is_loss = ui.env.finish_times[0, 0].item() == 0
+            ui.logger.save_game(is_loss)
 
         ui.state = "MENU"
 
+def resource_path(relative_path):
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
 if __name__ == "__main__":
-    run_game('Palace_king.pth')
+    run_game(resource_path('Palace_king.pth'))
 
     # test to make sure data was saved correctly
-    logger = PalaceExpertDataset()
-    print(f"Logged {logger.__len__()} expert steps.")
-    print("Sample step data:")
-    sample_obs, sample_history, sample_action, sample_corrected = logger.__getitem__(0)
-    print("Static Obs:", sample_obs)
-    print("Action History:", sample_history)
-    print("Action Taken:", sample_action)
-    print("Corrected by Human:", sample_corrected)
+    logger = PalaceHumanDataset()

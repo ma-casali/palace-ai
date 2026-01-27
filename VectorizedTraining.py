@@ -8,9 +8,10 @@ import cProfile
 import pstats
 import time
 import os
+import sys
 import multiprocessing
 import gc
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import glob
 from Cocoa import NSAutoreleasePool
 
@@ -23,44 +24,32 @@ print(f"Using device: {device}")
 
 # region Classes
 
-class PalaceExpertDataset(Dataset):
+class PalaceHumanDataset(Dataset):
     def __init__(self, data_dir="ground_truth_logs", seq_len=12):
         self.samples = []
         self.seq_len = seq_len
         
         # Find all saved game files
-        files = glob.glob(os.path.join(data_dir, "*.npz"))
+        files = glob.glob(resource_path(os.path.join(data_dir, "*.npz")))
         
         for f in files:
             with np.load(f) as data:
-                statics = data['static']  # Shape: (GameSteps, Obs_Dim)
+                statics = data['static'] # Shape: (GameSteps, Obs_Dim)
                 hists = data['hist']      # Shape: (GameSteps, Hist_Dim)
                 actions = data['actions']  # Shape: (GameSteps,)
                 corrections = data.get('is_human_correction', np.zeros_like(actions))  # Shape: (GameSteps,)
-                
-                # Create sliding windows of size 'seq_len'
-                # We need at least 'seq_len' steps to form a full input
-                for i in range(len(actions)):
-                    # If game is shorter than seq_len, we pad with zeros
-                    start_idx = max(0, i - self.seq_len + 1)
-                    
-                    s_window = statics[start_idx : i + 1]
-                    h_window = hists[start_idx : i + 1]
-                    target_action = actions[i]
-                    
-                    # Pad if the window is too small
-                    if len(s_window) < self.seq_len:
-                        print(s_window.shape, h_window.shape)
+                is_loss = data.get('is_loss', False)
 
-                        pad_amt = self.seq_len - len(s_window)
-                        s_window = np.pad(s_window[0], ((pad_amt, 0), (0, 0)), mode='constant')
-                        h_window = np.pad(h_window[0], ((pad_amt, 0), (0, 0)), mode='constant')
-                    
+                if isinstance(is_loss, list) or isinstance(is_loss, np.ndarray):
+                    is_loss = is_loss[0]
+
+                for i in range(len(actions)):
                     self.samples.append({
-                        'static': s_window.astype(np.float32),
-                        'hist': h_window.astype(np.float32),
-                        'action': int(target_action),
-                        'is_human_correction': bool(corrections[i])
+                        'static': statics[i].astype(np.float32),
+                        'hist': hists[i].astype(np.float32),
+                        'action': int(actions[i]),
+                        'is_human_correction': bool(corrections[i]),
+                        'is_loser': is_loss
                     })
                     
         print(f"Loaded {len(self.samples)} training sequences from {len(files)} games.")
@@ -70,14 +59,28 @@ class PalaceExpertDataset(Dataset):
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
+
+        # weight the samples differently depending on correction flag / loser flag
+        weight = 0.2 if sample['is_loser'] else 1.0
+
+        if sample['is_human_correction'] and not sample['is_loser']:
+            weight *= 1.5  # increase weight for human-corrected samples
+
         return (
-            torch.from_numpy(sample['static']),
-            torch.from_numpy(sample['hist']),
+            torch.from_numpy(sample['static']).squeeze(),
+            torch.from_numpy(sample['hist']).squeeze(),
             torch.tensor(sample['action'], dtype=torch.long),
-            torch.tensor(sample['is_human_correction'], dtype=torch.bool)
+            torch.tensor(weight, dtype=torch.float32)
         )
 
 # region Functions
+def resource_path(relative_path):
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
 
 def debug_memory_usage():
     print("\n---Memory Usage Debug Info---")
@@ -151,7 +154,7 @@ def create_static_input_vector(env):
 
     return torch.cat(parts, dim = 1).float()  # (B, 73)
 
-def finish_batch_update(optimizer, players, b_lp, b_ent, b_rew, b_counters, ent_coef, king_available=False):
+def finish_batch_update(optimizer, players, b_lp, b_ent, b_rew, b_counters, ent_coef, king_available=False, h_loss = None, h_alpha = 0.1):
 
     """
     Docstring for finish_batch_update
@@ -180,7 +183,7 @@ def finish_batch_update(optimizer, players, b_lp, b_ent, b_rew, b_counters, ent_
     
     gamma = 0.98 # reduction factor for returns
     start_idx = 1 if king_available else 0
-    total_loss = 0.0
+    rl_loss = 0.0
     for p_idx in range(start_idx, len(players)):
 
         max_t = b_lp.shape[2]
@@ -201,7 +204,12 @@ def finish_batch_update(optimizer, players, b_lp, b_ent, b_rew, b_counters, ent_
         policy_loss = -(flat_lp * flat_ret).mean()
         entropy_loss = -ent_coef * flat_ent.mean()
         
-        total_loss += (policy_loss + entropy_loss)
+        rl_loss = rl_loss + (policy_loss + entropy_loss)
+
+    if h_loss is not None:
+        total_loss = rl_loss + h_alpha * h_loss
+    else:
+        total_loss = rl_loss
 
     if isinstance(total_loss, torch.Tensor):
         optimizer.zero_grad()
@@ -231,6 +239,8 @@ def training_step(players, best_player_weights, batch_size, sequence_length, lev
     if best_player_weights is not None:
         # P0 is our king, others are learning
         players[0].load_state_dict(best_player_weights)
+        players[0].eval()
+    
     for i in range(1, env.num_players):
         players[i].train()
 
@@ -379,7 +389,7 @@ def update_level_distribution(wins, counts, current_probs):
     total = sum(new_probs)
     return [p / total for p in new_probs]
 
-def evaluate_players(players, num_games=100, sequence_length=6, max_turns=500):
+def evaluate_players(shared_player, num_games=100, sequence_length=6, max_turns=500):
     # Initialize environment
     env = PalaceEnv(batch_size=num_games, num_players=3, device=device)
     env.reset(players)
@@ -664,9 +674,13 @@ if __name__ == "__main__":
     num_generations = 1000
     batch_size = 1024
 
-    # learning rate
-    initial_lr = 1e-3
-    final_lr = 1e-4
+    # # learning rate (new training from scratch)
+    # initial_lr = 1e-3
+    # final_lr = 1e-4
+
+    # learning rate (continue training from saved king)
+    initial_lr = 1e-4
+    final_lr = 1e-5
 
     # entropy coefficient parameters
     initial_ent = 0.1
@@ -682,10 +696,23 @@ if __name__ == "__main__":
     sequence_length_inc = 3 # increase history length every N generations
     sequence_length_inc_interval = 200 # increase history length every N generations
 
-    # initialize shared player
+    # # initialize shared player (completely new)
+    # shared_player = PalacePlayer().to(device)
+    # shared_player.apply(init_weights)
+    # players = [shared_player for _ in range(3)]
+
+    # iniitialize shared player (from saved weights)
     shared_player = PalacePlayer().to(device)
-    shared_player.apply(init_weights)
-    players = [shared_player for _ in range(3)]
+    shared_player.load_state_dict(torch.load('Palace_King.pth', map_location=device))
+
+    king_player = PalacePlayer().to(device)
+    king_player.load_state_dict(torch.load('Palace_King.pth', map_location=device))
+    king_player.eval()
+
+    players = [king_player, shared_player, shared_player]
+
+    # get dataset for human games
+    human_dataset = PalaceHumanDataset()
 
     # separate parameters for weight decay
     decay_params = []
@@ -737,12 +764,31 @@ if __name__ == "__main__":
     # endregion
 
     try:
+
+        human_loader = DataLoader(human_dataset, batch_size=256, shuffle=True, drop_last=True)
+        human_iterator = iter(human_loader)
         
         for generation in range(num_generations):
             start_time = time.perf_counter()
 
             pool = NSAutoreleasePool.alloc().init()
             try:
+
+                # Human imitation learning step
+                try:
+                    h_static, h_hist, h_action, h_weights = next(human_iterator)
+                except StopIteration:
+                    human_iterator = iter(human_loader)
+                    h_static, h_hist, h_action, h_weights = next(human_iterator)
+                h_mask = torch.ones((h_static.size(0), 79), device=device) # human actions are always valid
+
+                # zero-init hidden states for human dataset
+                (h0, c0) = shared_player.init_hidden(h_static.size(0))
+                h_logits, _ = shared_player(h_hist.to(device), h_static.to(device), h_mask, hidden_state = (h0, c0))
+                
+                criterion = torch.nn.CrossEntropyLoss(reduction='none')
+                h_loss = criterion(h_logits, h_action.to(device))
+                h_weighted_loss = (h_loss * h_weights.to(device)).mean()
 
                 # Prepare players for this generation
                 b_lp, b_rew, b_ent, player_counters, stalemate_rate, level_wins, level_counts, king_win_rate, learner_win_rate = training_step(players, best_player_weights, batch_size, sequence_length, level_wins, level_counts, current_level_probs)
@@ -769,7 +815,9 @@ if __name__ == "__main__":
                     players,
                     b_lp, b_ent, b_rew, player_counters,
                     ent_coef=current_ent_coef, 
-                    king_available=(best_player_weights is not None)
+                    king_available=(best_player_weights is not None),
+                    h_loss = h_weighted_loss,
+                    h_alpha = 0.1
                 )           
 
                 # 1. Prepare level distribution for logging
@@ -792,7 +840,7 @@ if __name__ == "__main__":
                 gc.collect()
 
             # region Player Evaluation
-            if generation % 5 == 0 and generation >= 25:
+            if generation % 5 == 0: # and generation >= 25:
                 
                 num_games = 1024
                 loss_history = evaluate_players(players, num_games=num_games, sequence_length=sequence_length)
@@ -820,7 +868,10 @@ if __name__ == "__main__":
                 if new_king_idx != 0:
                     print(f"New King: Player {new_king_idx} ({reason})")
                     best_player_weights = copy.deepcopy(players[new_king_idx].state_dict())
+                    players[0].load_state_dict(best_player_weights)
+                    players[0].eval()
                     save_best_player(players[new_king_idx], filename='temporary_king.pth')
+
                 elif new_king_idx == 0 and best_player_weights is None:
                     # First time assigning king
                     best_player_weights = copy.deepcopy(players[0].state_dict())
